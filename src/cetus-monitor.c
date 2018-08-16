@@ -42,6 +42,7 @@
 #include "sharding-config.h"
 
 #include <netdb.h>
+#include <arpa/inet.h>
 
 #define CHECK_ALIVE_INTERVAL 3
 #define CHECK_ALIVE_TIMES 2
@@ -192,34 +193,34 @@ group_replication_detect(network_backends_t *bs, cetus_monitor_t *monitor)
         gchar old_master[ADDRESS_LEN] = {""};
 
         if(conn == NULL) {
-            g_debug("get connection failed. error: %d, text: %s, backend: %s",
+            g_message("get connection failed. error: %d, text: %s, backend: %s",
                                                                  mysql_errno(conn), mysql_error(conn), backend_addr);
             continue;
         }
 
         if(mysql_real_query(conn, L(sql1))) {
-            g_debug("select primary info failed for group_replication. error: %d, text: %s, backend: %s",
+            g_message("select primary info failed for group_replication. error: %d, text: %s, backend: %s",
                                            mysql_errno(conn), mysql_error(conn), backend_addr);
             continue;
         }
 
         rs_set = mysql_store_result(conn);
         if(rs_set == NULL) {
-            g_debug("get primary info result set failed for group_replication. error: %d, text: %s, backend: %s",
+            g_message("get primary info result set failed for group_replication. error: %d, text: %s, backend: %s",
                                                        mysql_errno(conn), mysql_error(conn), backend_addr);
             continue;
         }
 
         row = mysql_fetch_row(rs_set);
         if(row == NULL || row[0] == NULL || row[1] == NULL) {
-            g_debug("get primary info rows failed for group_replication. error: %d, text: %s, backend: %s",
+            g_message("get primary info rows failed for group_replication. error: %d, text: %s, backend: %s",
                                                                    mysql_errno(conn), mysql_error(conn), backend_addr);
             mysql_free_result(rs_set);
             continue;
         }
 
         if((get_ip_by_name(row[0], ip) != 0) || ip[0] == '\0') {
-            g_debug("get master ip by name failed. error: %d, text: %s, backend: %s",
+            g_message("get master ip by name failed. error: %d, text: %s, backend: %s",
                                                                    mysql_errno(conn), mysql_error(conn), backend_addr);
             mysql_free_result(rs_set);
             continue;
@@ -241,7 +242,7 @@ group_replication_detect(network_backends_t *bs, cetus_monitor_t *monitor)
         rs_set = NULL;
 
         if(master_addr[0] == '\0') {
-            g_debug("get master address failed. error: %d, text: %s, backend: %s",
+            g_message("get master address failed. error: %d, text: %s, backend: %s",
                                                                    mysql_errno(conn), mysql_error(conn), backend_addr);
             continue;
         }
@@ -249,28 +250,28 @@ group_replication_detect(network_backends_t *bs, cetus_monitor_t *monitor)
         if(strcasecmp(backend_addr, master_addr)) {
             conn = get_mysql_connection(monitor, master_addr);
             if(conn == NULL) {
-                g_debug("get connection failed. error: %d, text: %s, backend: %s",
+                g_message("get connection failed. error: %d, text: %s, backend: %s",
                                                                     mysql_errno(conn), mysql_error(conn), master_addr);
                 continue;
             }
         }
 
         if(mysql_real_query(conn, L(sql2))) {
-            g_debug("select slave info failed for group_replication. error: %d, text: %s, backend: %s",
+            g_message("select slave info failed for group_replication. error: %d, text: %s, backend: %s",
                                            mysql_errno(conn), mysql_error(conn), master_addr);
             continue;
         }
 
         rs_set = mysql_store_result(conn);
         if(rs_set == NULL) {
-            g_debug("get slave info result set failed for group_replication. error: %d, text: %s",
+            g_message("get slave info result set failed for group_replication. error: %d, text: %s",
                                                        mysql_errno(conn), mysql_error(conn));
             continue;
         }
         while(row=mysql_fetch_row(rs_set)) {
             memset(ip, 0, ADDRESS_LEN);
             if((get_ip_by_name(row[0], ip) != 0) || ip[0] == '\0') {
-                g_debug("get slave ip by name failed. error: %d, text: %s",
+                g_message("get slave ip by name failed. error: %d, text: %s",
                                                        mysql_errno(conn), mysql_error(conn));
                 mysql_free_result(rs_set);
                 continue;
@@ -279,9 +280,9 @@ group_replication_detect(network_backends_t *bs, cetus_monitor_t *monitor)
             snprintf(slave_addr, ADDRESS_LEN, "%s:%s", ip, row[1]);
             if(slave_addr[0] != '\0') {
                 slave_list = g_list_append(slave_list, strdup(slave_addr));
-                g_debug("add slave %s in list, %d", slave_addr, g_list_length(slave_list));
+                g_message("add slave %s in list, %d", slave_addr, g_list_length(slave_list));
             } else {
-                g_debug("get slave address failed. error: %d, text: %s",
+                g_message("get slave address failed. error: %d, text: %s",
                                                        mysql_errno(conn), mysql_error(conn));
             }
         }
@@ -384,6 +385,25 @@ group_replication_detect(network_backends_t *bs, cetus_monitor_t *monitor)
     event_base_set(monitor->evloop, &(monitor->ev_struct));\
     evtimer_add(&(monitor->ev_struct), &timeout);
 
+gint
+check_hostname(network_backend_t *backend)
+{
+     gint ret = 0;
+     gchar *p = NULL;
+     if (!backend) return ret;
+     gchar old_addr[INET_ADDRSTRLEN] = {""};
+     inet_ntop(AF_INET, &(backend->addr->addr.ipv4.sin_addr), old_addr, sizeof(old_addr));
+     if (0 != network_address_set_address(backend->addr, backend->address->str)) {
+         return ret;
+     }
+     char new_addr[INET_ADDRSTRLEN] = {""};
+     inet_ntop(AF_INET, &(backend->addr->addr.ipv4.sin_addr), new_addr, sizeof(new_addr));
+     if (strcmp (old_addr, new_addr) != 0) {
+         ret = 1;
+     }
+     return ret;
+ }
+
 static void
 check_backend_alive(int fd, short what, void *arg)
 {
@@ -407,6 +427,7 @@ check_backend_alive(int fd, short what, void *arg)
         char *backend_addr = backend->addr->name->str;
         int check_count = 0;
         MYSQL *conn = NULL;
+hostnameloop:
         while (++check_count <= CHECK_ALIVE_TIMES) {
             conn = get_mysql_connection(monitor, backend_addr);
             if (conn)
@@ -414,6 +435,11 @@ check_backend_alive(int fd, short what, void *arg)
         }
 
         if (conn == NULL) {
+            if (chas->check_dns) {
+                if (check_hostname(backend)) {
+                    goto hostnameloop;
+                }
+            }
             if (backend->state != BACKEND_STATE_DOWN) {
                 if (backend->type != BACKEND_TYPE_RW) {
                     ret = network_backends_modify(bs, i, backend->type, BACKEND_STATE_DOWN, oldstate);
@@ -482,8 +508,14 @@ update_master_timestamp(int fd, short what, void *arg)
                      HEARTBEAT_DB, monitor->config_id, cur_time_str, cur_time_str);
 
             char *backend_addr = backend->addr->name->str;
+hostnameloop:;
             MYSQL *conn = get_mysql_connection(monitor, backend_addr);
             if (conn == NULL) {
+                if (chas->check_dns) {
+                    if (check_hostname(backend)) {
+                        goto hostnameloop;
+                    }
+                }   
                 g_critical("Could not connect to Backend %s.", backend_addr);
             } else {
                 if (backend->state != BACKEND_STATE_UP) {
@@ -532,8 +564,14 @@ check_slave_timestamp(int fd, short what, void *arg)
             continue;
 
         char *backend_addr = backend->addr->name->str;
+hostnameloop:;
         MYSQL *conn = get_mysql_connection(monitor, backend_addr);
         if (conn == NULL) {
+            if (chas->check_dns) {
+                if (check_hostname(backend)) {
+                    goto hostnameloop;
+                }
+            }
             g_critical("Connection error when read delay from RO backend: %s", backend_addr);
             if (backend->state != BACKEND_STATE_DOWN) {
                 ret = network_backends_modify(bs, i, backend->type, BACKEND_STATE_DOWN, oldstate);

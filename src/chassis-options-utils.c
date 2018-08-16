@@ -1314,8 +1314,11 @@ gchar* show_sql_log_maxsize(gpointer param) {
     struct external_param *opt_param = (struct external_param *)param;
     chassis *srv = opt_param->chas;
     gint opt_type = opt_param->opt_type;
-    if (CAN_SHOW_OPTS_PROPERTY(opt_type) || CAN_SAVE_OPTS_PROPERTY(opt_type)) {
+    if (CAN_SHOW_OPTS_PROPERTY(opt_type)) {
         return g_strdup_printf("%u M", srv->sql_mgr->sql_log_maxsize);
+    }
+    if (CAN_SAVE_OPTS_PROPERTY(opt_type)) {
+        return g_strdup_printf("%u", srv->sql_mgr->sql_log_maxsize);
     }
     return NULL;
 }
@@ -1433,6 +1436,46 @@ assign_sql_log_maxnum(const gchar *newval, gpointer param) {
                     ret = ASSIGN_VALUE_INVALID;
                 } else {
                     srv->sql_mgr->sql_log_maxnum = value;
+                    ret = ASSIGN_OK;
+                }
+            } else {
+                ret = ASSIGN_VALUE_INVALID;
+            }
+        } else {
+            ret = ASSIGN_VALUE_INVALID;
+        }
+    }
+    return ret;
+}
+
+gchar*
+show_check_dns(gpointer param) {
+    struct external_param *opt_param = (struct external_param *)param;
+    chassis *srv = opt_param->chas;
+    gint opt_type = opt_param->opt_type;
+    if (CAN_SHOW_OPTS_PROPERTY(opt_type)) {
+        return g_strdup_printf("%s", srv->check_dns ? "true" : "false");
+    }
+    if (CAN_SAVE_OPTS_PROPERTY(opt_type)) {
+        return (srv->check_dns == 0) ? g_strdup("false") : NULL;
+    }
+    return NULL;
+}
+
+gint
+assign_check_dns(const gchar *newval, gpointer param) {
+    gint ret = ASSIGN_ERROR;
+    struct external_param *opt_param = (struct external_param *)param;
+    chassis *srv = opt_param->chas;
+    gint opt_type = opt_param->opt_type;
+    if (CAN_ASSIGN_OPTS_PROPERTY(opt_type)) {
+        if (NULL != newval) {
+            gint value = 0;
+            if (try_get_int_value(newval, &value)) {
+                if (value < 0) {
+                    ret = ASSIGN_VALUE_INVALID;
+                } else {
+                    srv->check_dns = value;
                     ret = ASSIGN_OK;
                 }
             } else {
