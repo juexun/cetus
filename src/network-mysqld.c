@@ -78,6 +78,7 @@
 
 #include "network-compress.h"
 #include "network-ssl.h"
+#include "chassis-sql-log.h"
 
 #ifdef HAVE_WRITEV
 #define USE_BUFFERED_NETIO
@@ -1875,8 +1876,8 @@ disp_xa_abnormal_resultset(network_mysqld_con *con, server_session_t *ss,
 
     } else if (con->dist_tran_state <= NEXT_ST_XA_ROLLBACK) {
         if (ss->dist_tran_state < con->dist_tran_state) {
-            ss->dist_tran_state = con->dist_tran_state;
             g_message("%s:adjust ss dist state:%d to %d", G_STRLOC, ss->dist_tran_state, con->dist_tran_state);
+            ss->dist_tran_state = con->dist_tran_state;
         }
 
         if (*is_xa_cmd_met) {
@@ -2727,6 +2728,7 @@ shard_read_response(network_mysqld_con *con, server_session_t *ss)
                 } else {
                     server_sess_wait_for_event(ss, EV_READ, &con->read_timeout);
                 }
+
                 return DISP_CONTINUE;
             }
             break;
@@ -2744,7 +2746,6 @@ shard_read_response(network_mysqld_con *con, server_session_t *ss)
             }
         }
     }
-
     int is_finished = 0;
     switch (network_mysqld_read_mul_packets(con->srv, con, ss->server, &is_finished)) {
     case NETWORK_SOCKET_SUCCESS:
@@ -2759,6 +2760,14 @@ shard_read_response(network_mysqld_con *con, server_session_t *ss)
             ss->state = NET_RW_STATE_FINISHED;
             ss->server->is_read_finished = 1;
             ss->server->is_waiting = 0;
+            if (con->srv->sql_mgr && con->srv->sql_mgr->sql_log_switch == ON) {
+                ss->ts_read_query_result_last = get_timer_microseconds();
+                network_mysqld_com_query_result_t *query = con->parse.data;
+                if (query && query->query_status == MYSQLD_PACKET_ERR) {
+                    ss->query_status = MYSQLD_PACKET_ERR;
+                }
+                log_sql_backend_sharding(con, ss);
+            }
             break;
         } else {
             ss->state = NET_RW_STATE_READ;
@@ -2816,7 +2825,7 @@ shard_read_response(network_mysqld_con *con, server_session_t *ss)
         break;
     case NETWORK_SOCKET_ERROR:
     default:
-        g_critical("%s:network_mysqld_read_mul_packets error", G_STRLOC);
+        g_critical("%s:network_mysqld_read_mul_packets error for con:%p", G_STRLOC, con);
         con->num_read_pending--;
         con->state = ST_ERROR;
         return DISP_CONTINUE;
@@ -2905,7 +2914,6 @@ static int
 read_server_resp(network_mysqld_con *con, int *disp_flag)
 {
     int i;
-
     for (i = 0; i < con->servers->len; i++) {
         server_session_t *ss = g_ptr_array_index(con->servers, i);
 
@@ -2984,12 +2992,14 @@ check_server_status(network_mysqld_con *con, int *srv_down_count, int *srv_respo
         server_session_t *ss = g_ptr_array_index(con->servers, i);
 
         if (!ss->participated) {
-            g_debug("%s: server not participated", G_STRLOC);
+            g_debug("%s: server:%d is not participated for con:%p",
+                    G_STRLOC, i, con);
             continue;
         }
 
         network_socket *server = ss->server;
         if (server->unavailable) {
+            g_debug("%s: server:%d is unavailable for con:%p", G_STRLOC, i, con);
             (*srv_down_count)++;
             continue;
         }
@@ -3068,9 +3078,13 @@ disp_resp_workers_not_matched(network_mysqld_con *con, int *disp_flag)
                 if (con->is_attr_adjust) {
                     g_critical("%s: attr adj met problems here for con:%p", G_STRLOC, con);
                     con->server_to_be_closed = 1;
+                } else if (con->is_timeout) {
+                    g_critical("%s: server timeout for con:%p", G_STRLOC, con);
+                    con->server_to_be_closed = 1;
                 } else {
                     if (con->dist_tran_state < NEXT_ST_XA_CANDIDATE_OVER) {
-                        g_debug("%s: build xa stmt for failure, state:%d", G_STRLOC, con->state);
+                        g_debug("%s: build xa stmt for failure, dist state:%d",
+                                G_STRLOC, con->dist_tran_state);
                         build_xa_statements(con);
                         if (con->dist_tran_state != NEXT_ST_XA_OVER) {
                             *disp_flag = DISP_CONTINUE;
@@ -3309,7 +3323,8 @@ disp_after_resp(network_mysqld_con *con, int srv_down_count, int srv_response_co
 static int
 handle_read_mul_servers_resp(network_mysqld_con *con)
 {
-    g_debug("%s: visit handle_read_mul_servers_resp for con:%p", G_STRLOC, con);
+    g_debug("%s: visit handle_read_mul_servers_resp for con:%p, num pending:%d",
+            G_STRLOC, con, con->num_read_pending);
     int disp_flag = 0;
 
     int srv_down_count = 0, srv_response_count = 0;
