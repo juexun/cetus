@@ -18,9 +18,9 @@ void admin_select_conn_details(network_mysqld_con* con);
 void admin_select_all_backends(network_mysqld_con*);
 void admin_select_all_groups(network_mysqld_con* con);
 void admin_show_connectionlist(network_mysqld_con *admin_con, int show_count);
-void admin_show_allow_ip(network_mysqld_con *con, const char* module_name);
-void admin_add_allow_ip(network_mysqld_con *con, char *module, char *addr);
-void admin_delete_allow_ip(network_mysqld_con *con, char* module, char* ip);
+void admin_acl_show_rules(network_mysqld_con *con, gboolean is_white);
+void admin_acl_add_rule(network_mysqld_con *con, gboolean is_white, char *addr);
+void admin_acl_delete_rule(network_mysqld_con *con, gboolean is_white, char* ip);
 void admin_set_reduce_conns(network_mysqld_con* con, int mode);
 void admin_set_maintain(network_mysqld_con* con, int mode);
 void admin_show_maintain(network_mysqld_con* con);
@@ -61,4 +61,5 @@ void admin_select_single_table(network_mysqld_con*);
 void admin_sql_log_start(network_mysqld_con* con);
 void admin_sql_log_stop(network_mysqld_con* con);
 void admin_sql_log_status(network_mysqld_con* con);
+void admin_kill_query(network_mysqld_con* con, int id);
 #endif // ADMIN_COMMANDS_H

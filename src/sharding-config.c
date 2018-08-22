@@ -382,7 +382,7 @@ shard_conf_is_shard_table(const char *db, const char *table)
 }
 
 GPtrArray *
-shard_conf_get_fixed_group(GPtrArray *groups, guint32 fixture)
+shard_conf_get_fixed_group(GPtrArray *groups, guint64 fixture)
 {
     int len = g_list_length(shard_conf_all_groups);
     if (len == 0) {
@@ -1051,7 +1051,7 @@ gboolean shard_conf_write_json(chassis_config_t* conf_manager)
     }
 
     char* json_str = cJSON_Print(root);
-    chassis_config_write_object(conf_manager, "sharding-new", json_str);
+    chassis_config_write_object(conf_manager, "sharding", json_str);
     cJSON_Delete(root);
     g_free(json_str);
     return TRUE;

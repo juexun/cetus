@@ -72,13 +72,10 @@
 #include "cetus-monitor.h"
 #include "cetus-variable.h"
 #include "plugin-common.h"
-#ifdef NETWORK_DEBUG_TRACE_STATE_CHANGES
-#include "cetus-query-queue.h"
-#endif
-
 #include "network-compress.h"
 #include "network-ssl.h"
 #include "chassis-sql-log.h"
+#include "cetus-acl.h"
 
 #ifdef HAVE_WRITEV
 #define USE_BUFFERED_NETIO
@@ -178,6 +175,7 @@ network_mysqld_priv_init(void)
     priv->backends = network_backends_new();
     priv->users = cetus_users_new();
     priv->monitor = cetus_monitor_new();
+    priv->acl = cetus_acl_new();
     priv->thread_id = 1;
     return priv;
 }
@@ -229,6 +227,7 @@ network_mysqld_priv_free(chassis G_GNUC_UNUSED *chas, chassis_private *priv)
     cetus_users_free(priv->users);
     g_free(priv->stats_variables);
     cetus_monitor_free(priv->monitor);
+    cetus_acl_free(priv->acl);
     g_free(priv);
 }
 
@@ -291,9 +290,6 @@ network_mysqld_con_new()
 
     con->wait_clt_next_sql.tv_sec = 0;
     con->wait_clt_next_sql.tv_usec = 256 * 1000;
-#ifdef NETWORK_DEBUG_TRACE_STATE_CHANGES
-    con->recent_queries = query_queue_new(20);
-#endif
     return con;
 }
 
@@ -306,6 +302,24 @@ network_mysqld_add_connection(chassis *srv, network_mysqld_con *con, gboolean li
     if (listen) {
         srv->priv->listen_conns = g_list_append(srv->priv->listen_conns, con);
     }
+}
+
+gboolean
+network_mysqld_kill_connection(chassis *srv, guint64 id)
+{
+    int i = 0;
+    for (i = 0; i < srv->priv->cons->len; ++i) {
+        network_mysqld_con* con = g_ptr_array_index(srv->priv->cons, i);
+        if (con->id == id) {
+            g_ptr_array_remove_index(srv->priv->cons, i);
+            con->server_to_be_closed = 1;
+            plugin_call_cleanup(srv, con);
+            g_message(G_STRLOC "kill query %lu", con->id);
+            network_mysqld_con_free(con);
+            return TRUE;
+        }
+    }
+    return FALSE;
 }
 
 static void
@@ -388,9 +402,6 @@ network_mysqld_con_free(network_mysqld_con *con)
     con->srv->priv->listen_conns = g_list_remove(con->srv->priv->listen_conns, con);
     con->srv->allow_new_conns = TRUE;
 
-#ifdef NETWORK_DEBUG_TRACE_STATE_CHANGES
-    query_queue_free(con->recent_queries);
-#endif
     g_free(con);
 }
 
@@ -4225,7 +4236,7 @@ network_mysqld_con_accept(int G_GNUC_UNUSED event_fd, short events, void *user_d
 
     network_mysqld_add_connection(listen_con->srv, client_con, FALSE);
 
-    client_con->key = client_con->srv->sess_key++;
+    client_con->id = client_con->srv->sess_key++; /*TODO: duplicate check */
 
     /**
      * inherit the config to the new connection 
@@ -5099,5 +5110,4 @@ check_and_create_conns_func(int fd, short what, void *arg)
     struct timeval check_interval = {30, 0};
     chassis_event_add_with_timeout(chas, &chas->auto_create_conns_event, &check_interval);
 }
-
 

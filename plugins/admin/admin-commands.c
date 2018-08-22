@@ -11,6 +11,7 @@
 #include "cetus-users.h"
 #include "cetus-util.h"
 #include "cetus-variable.h"
+#include "cetus-acl.h"
 #include "character-set.h"
 #include "chassis-event.h"
 #include "chassis-options.h"
@@ -25,6 +26,7 @@
 #include "sharding-config.h"
 #include "chassis-options-utils.h"
 #include "chassis-sql-log.h"
+#include "cetus-acl.h"
 
 static const char *get_conn_xa_state_name(network_mysqld_con_dist_tran_state_t state) {
     switch (state) {
@@ -385,6 +387,11 @@ void admin_show_connectionlist(network_mysqld_con *admin_con, int show_count)
     fields = g_ptr_array_new_with_free_func((void *) network_mysqld_proto_fielddef_free);
 
     field = network_mysqld_proto_fielddef_new();
+    field->name = g_strdup("Id");
+    field->type = MYSQL_TYPE_STRING;
+    g_ptr_array_add(fields, field);
+
+    field = network_mysqld_proto_fielddef_new();
     field->name = g_strdup("User");
     field->type = MYSQL_TYPE_STRING;
     g_ptr_array_add(fields, field);
@@ -467,6 +474,7 @@ void admin_show_connectionlist(network_mysqld_con *admin_con, int show_count)
         count++;
 
         row = g_ptr_array_new_with_free_func(g_free);
+        g_ptr_array_add(row, g_strdup_printf("%lu", con->id));
         if (con->client->response != NULL) {
             g_ptr_array_add(row, g_strdup(con->client->response->username->str));
         } else {
@@ -554,100 +562,6 @@ void admin_show_connectionlist(network_mysqld_con *admin_con, int show_count)
     g_ptr_array_free(fields, TRUE);
 }
 
-void admin_show_allow_ip(network_mysqld_con *con, const char* module_name)
-{
-    if (strcmp(module_name, "admin") != 0
-        && strcmp(module_name, "proxy") != 0
-        && strcmp(module_name, "shard") != 0) {
-        network_mysqld_con_send_error(con->client, C("unknown module name"));
-        return;
-    }
-    chassis *chas = con->srv;
-    GPtrArray *fields = g_ptr_array_new_with_free_func((void *) network_mysqld_proto_fielddef_free);
-    MYSQL_FIELD *field;
-    GPtrArray *rows = g_ptr_array_new_with_free_func((void *) network_mysqld_mysql_field_row_free);
-    GPtrArray *row;
-
-    field = network_mysqld_proto_fielddef_new();
-    field->name = g_strdup("Plugin");
-    field->type = MYSQL_TYPE_STRING;
-    g_ptr_array_add(fields, field);
-    field = network_mysqld_proto_fielddef_new();
-    field->name = g_strdup("Address");
-    field->type = MYSQL_TYPE_STRING;
-    g_ptr_array_add(fields, field);
-
-    int i;
-    for (i = 0; i < chas->modules->len; i++) {
-        chassis_plugin *plugin = chas->modules->pdata[i];
-        if (strcmp(plugin->name, module_name) == 0) {
-            GList *allow_ip_list = plugin->allow_ip_get(plugin->config);
-            if (allow_ip_list) {
-                GList *cur_p = allow_ip_list;
-                while (cur_p) {
-                    row = g_ptr_array_new_with_free_func(g_free);
-                    g_ptr_array_add(row, g_strdup(module_name));
-                    g_ptr_array_add(row, g_strdup((char *) cur_p->data));
-                    g_ptr_array_add(rows, row);
-                    cur_p = cur_p->next;
-                }
-            }
-            break;
-        }
-    }
-
-    network_mysqld_con_send_resultset(con->client, fields, rows);
-
-    /* Free data */
-    g_ptr_array_free(rows, TRUE);
-    g_ptr_array_free(fields, TRUE);
-}
-
-void admin_add_allow_ip(network_mysqld_con *con, char *module_name, char *addr)
-{
-    if (strcmp(module_name, "admin") != 0
-        && strcmp(module_name, "proxy") != 0
-        && strcmp(module_name, "shard") != 0) {
-        network_mysqld_con_send_error(con->client, C("no such module"));
-        return;
-    }
-
-    chassis *chas = con->srv;
-    int i;
-    gboolean success = FALSE;
-    for (i = 0; i < chas->modules->len; i++) {
-        chassis_plugin *plugin = chas->modules->pdata[i];
-        if (strcmp(plugin->name, module_name) == 0) {
-            success = plugin->allow_ip_add(plugin->config, addr);
-            break;
-        }
-    }
-    network_mysqld_con_send_ok_full(con->client, success, 0, SERVER_STATUS_AUTOCOMMIT, 0);
-    return;
-}
-
-void admin_delete_allow_ip(network_mysqld_con *con, char *module_name, char *addr)
-{
-    if (strcmp(module_name, "admin") != 0
-        && strcmp(module_name, "proxy") != 0
-        && strcmp(module_name, "shard") != 0) {
-        network_mysqld_con_send_error(con->client, C("no such module"));
-        return;
-    }
-    chassis *chas = con->srv;
-    int i;
-    gboolean success = FALSE;
-    for (i = 0; i < chas->modules->len; i++) {
-        chassis_plugin *plugin = chas->modules->pdata[i];
-        if (strcmp(plugin->name, module_name) == 0) {
-            success = plugin->allow_ip_del(plugin->config, addr);
-            break;
-        }
-    }
-    network_mysqld_con_send_ok_full(con->client, success, 0, SERVER_STATUS_AUTOCOMMIT, 0);
-    return;
-}
-
 #define MAKE_FIELD_DEF_1_COL(fields, col_name)  \
     do {\
     MYSQL_FIELD *field = network_mysqld_proto_fielddef_new();\
@@ -708,6 +622,43 @@ void admin_delete_allow_ip(network_mysqld_con *con, char *module_name, char *add
     g_ptr_array_add(rows, row);\
     }while(0)
 
+
+void admin_acl_show_rules(network_mysqld_con *con, gboolean is_white)
+{
+    GPtrArray *fields = network_mysqld_proto_fielddefs_new();
+    MAKE_FIELD_DEF_2_COL(fields, "User", "Host");
+
+    GPtrArray *rows = g_ptr_array_new_with_free_func(
+        (void *)network_mysqld_mysql_field_row_free);
+
+    chassis_private *priv = con->srv->priv;
+    GList* l = is_white ? priv->acl->whitelist : priv->acl->blacklist;
+    for (; l; l = l->next) {
+        struct cetus_acl_entry_t* entry = l->data;
+        APPEND_ROW_2_COL(rows, entry->username, entry->host);
+    }
+
+    network_mysqld_con_send_resultset(con->client, fields, rows);
+
+    g_ptr_array_free(rows, TRUE);
+    network_mysqld_proto_fielddefs_free(fields);
+}
+
+void admin_acl_add_rule(network_mysqld_con *con, gboolean is_white, char *addr)
+{
+    chassis *chas = con->srv;
+    gboolean ok = cetus_acl_add_rule_str(chas->priv->acl,
+                                         is_white?ACL_WHITELIST:ACL_BLACKLIST, addr);
+    network_mysqld_con_send_ok_full(con->client, ok, 0, SERVER_STATUS_AUTOCOMMIT, 0);
+}
+
+void admin_acl_delete_rule(network_mysqld_con *con, gboolean is_white, char *addr)
+{
+    chassis *chas = con->srv;
+    int affected = cetus_acl_delete_rule_str(chas->priv->acl,
+                                             is_white?ACL_WHITELIST:ACL_BLACKLIST, addr);
+    network_mysqld_con_send_ok_full(con->client, affected, 0, SERVER_STATUS_AUTOCOMMIT, 0);
+}
 
 /* only match % wildcard, case insensitive */
 static gboolean sql_pattern_like(const char* pattern, const char* string)
@@ -1072,7 +1023,6 @@ void admin_update_backend(network_mysqld_con* con, GList* equations,
 void admin_delete_backend(network_mysqld_con* con, char *key, char *val)
 {
     chassis_private *g = con->srv->priv;
-    int affected_rows = 0;
     int backend_ndx = -1;
     if (strcasecmp(key, "backend_ndx")==0) {
         backend_ndx = atoi(val);
@@ -1246,6 +1196,11 @@ void admin_set_config(network_mysqld_con* con, char* key, char* value)
 
     g_list_free(options);
 
+    if(0 == ret && !chassis_config_set_remote_options(con->srv->config_manager, key, value)) {
+        network_mysqld_con_send_error(con->client,C("Variable is set locally but cannot replace remote settings"));
+        return;
+    }
+
     if(0 == ret) {
         network_mysqld_con_send_ok_full(con->client, 1, 0, SERVER_STATUS_AUTOCOMMIT, 0);
     } else if(ASSIGN_NOT_SUPPORT == ret){
@@ -1384,9 +1339,9 @@ static struct sql_help_entry_t {
     {"select * from backends", "list the backends and their state", ALL_HELP},
     {"show connectionlist [<num>]", "show <num> connections", ALL_HELP},
     {"select * from groups","list the backends and their groups", SHARD_HELP},
-    {"show allow_ip <module>", "show allow_ip rules of module, currently admin|proxy|shard", ALL_HELP},
-    {"add allow_ip <module> '<address>'", "add address to white list of module", ALL_HELP},
-    {"delete allow_ip <module> '<address>'", "delete address from white list of module", ALL_HELP},
+    {"show allow_ip/deny_ip", "show allow_ip rules of module, currently admin|proxy|shard", ALL_HELP},
+    {"add allow_ip/deny_ip '<user>@<address>'", "add address to white list of module", ALL_HELP},
+    {"delete allow_ip/deny_ip '<user>@<address>'", "delete address from white list of module", ALL_HELP},
     {"set reduce_conns (true|false)", "reduce idle connections if set to true", ALL_HELP},
     {"set maintain (true|false)", "close all client connections if set to true", ALL_HELP},
     {"show status [like '%pattern%']", "show select/update/insert/delete statistics", ALL_HELP},
@@ -1791,7 +1746,7 @@ void admin_select_single_table(network_mysqld_con* con)
 }
 
 void admin_sql_log_start(network_mysqld_con* con) {
-    if (!con || !con->srv || !con->srv->sql_mgr) {
+    if (!con->srv->sql_mgr) {
         network_mysqld_con_send_error(con->client, C("Unexpected error"));
         return;
     }
@@ -1808,7 +1763,7 @@ void admin_sql_log_start(network_mysqld_con* con) {
 }
 
 void admin_sql_log_stop(network_mysqld_con* con) {
-    if (!con || !con->srv || !con->srv->sql_mgr) {
+    if (!con->srv->sql_mgr) {
         network_mysqld_con_send_error(con->client, C("Unexpected error"));
         return;
     }
@@ -1821,7 +1776,7 @@ void admin_sql_log_stop(network_mysqld_con* con) {
 }
 
 void admin_sql_log_status(network_mysqld_con* con) {
-    if (!con || !con->srv || !con->srv->sql_mgr) {
+    if (!con->srv->sql_mgr) {
         network_mysqld_con_send_error(con->client, C("Unexpected error"));
         return;
     }
@@ -1861,6 +1816,8 @@ void admin_sql_log_status(network_mysqld_con* con) {
     gchar *cursize = g_strdup_printf("%lu", con->srv->sql_mgr->sql_log_cursize);
     APPEND_ROW_3_COL(rows, "sql-log-cursize", cursize, "Internal");
 
+    APPEND_ROW_3_COL(rows, "sql-log-fullname", con->srv->sql_mgr->sql_log_fullname == NULL ? "NULL" : con->srv->sql_mgr->sql_log_fullname, "Internal");
+
     network_mysqld_con_send_resultset(con->client, fields, rows);
 
     network_mysqld_proto_fielddefs_free(fields);
@@ -1870,4 +1827,10 @@ void admin_sql_log_status(network_mysqld_con* con) {
     g_free(pattern);
     g_free(cached);
     g_free(cursize);
+}
+
+void admin_kill_query(network_mysqld_con* con, int id)
+{
+    gboolean ok = network_mysqld_kill_connection(con->srv, id);
+    network_mysqld_con_send_ok_full(con->client, ok ? 1 : 0, 0, SERVER_STATUS_AUTOCOMMIT, 0);
 }

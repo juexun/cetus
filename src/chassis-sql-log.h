@@ -8,8 +8,8 @@
 #include "network-injection.h"
 
 #define SQL_LOG_BUFFER_DEF_SIZE 1024*1024*10
-#define SQL_LOG_DEF_FILE_NAME "cetus_sql"
-#define SQL_LOG_DEF_SUFFIX "sql"
+#define SQL_LOG_DEF_FILE_PREFIX "cetus"
+#define SQL_LOG_DEF_SUFFIX "clg"
 #define SQL_LOG_DEF_PATH "/var/log/"
 #define SQL_LOG_DEF_IDLETIME 10000
 #define MEGABYTES 1024*1024
@@ -18,7 +18,7 @@
 
 #define GET_COM_NAME(com_type) \
      ((((gushort)com_type) >= 0 && ((gushort)com_type) <= 31) ? com_command_name[((gushort)com_type)].com_str : "UNKNOWN TYPE")
-#define GET_COM_STRING(query) GET_COM_NAME((query)->str[0]), ((query)->len > 1 ? ((query)->str + 1) : "")
+#define GET_COM_STRING(query) ((query)->len > 1 ? ((query)->str + 1) : "")
 
 typedef struct com_string {
     char *com_str;
@@ -63,7 +63,7 @@ struct sql_log_mgr {
     volatile guint sql_log_idletime;
     volatile guint sql_log_maxnum;
 
-    gchar *sql_log_filename;
+    gchar *sql_log_prefix;
     gchar *sql_log_path;
     GThread *thread;
     FILE *sql_log_fp;

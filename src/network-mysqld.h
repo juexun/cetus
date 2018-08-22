@@ -510,7 +510,7 @@ struct network_mysqld_con {
     int num_servers_visited;
     int num_write_pending;
     int num_read_pending;
-    unsigned int key;
+    guint64 id; /* session id */
 
     mysqld_query_attr_t query_attr;
 
@@ -649,7 +649,6 @@ struct network_mysqld_con {
     char last_backends_type[MAX_SERVER_NUM];
 
     struct sharding_plan_t *sharding_plan;
-    struct query_queue_t *recent_queries;
     void *data;
 };
 
@@ -749,6 +748,7 @@ struct chassis_private {
     struct cetus_variable_t *stats_variables;
     struct cetus_monitor_t *monitor;
     guint32 thread_id;
+    struct cetus_acl_t *acl;
 };
 
 NETWORK_API network_socket_retval_t
@@ -759,6 +759,7 @@ NETWORK_API void send_part_content_to_client(network_mysqld_con *con);
 NETWORK_API void set_conn_attr(network_mysqld_con *con, network_socket *server);
 NETWORK_API int network_mysqld_init(chassis *srv);
 NETWORK_API void network_mysqld_add_connection(chassis *srv, network_mysqld_con *con, gboolean listen);
+gboolean network_mysqld_kill_connection(chassis *srv, guint64 id);
 NETWORK_API void network_mysqld_con_handle(int event_fd, short events, void *user_data);
 NETWORK_API int network_mysqld_queue_append(network_socket *sock, network_queue *queue, const char *data, size_t len);
 NETWORK_API int network_mysqld_queue_append_raw(network_socket *sock, network_queue *queue, GString *data);

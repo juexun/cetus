@@ -157,7 +157,7 @@ struct sql_log_mgr *sql_log_alloc() {
         return (struct sql_log_mgr *)NULL;
     }
     mgr->sql_log_fp = NULL;
-    mgr->sql_log_filename = NULL;
+    mgr->sql_log_prefix = NULL;
     mgr->sql_log_path = NULL;
     mgr->sql_log_bufsize = SQL_LOG_BUFFER_DEF_SIZE;
     mgr->sql_log_mode = BACKEND;
@@ -187,7 +187,7 @@ static void free_queue_manually(GQueue *queue, GDestroyNotify free_func) {
 void sql_log_free(struct sql_log_mgr *mgr) {
     if (!mgr) return;
 
-    g_free(mgr->sql_log_filename);
+    g_free(mgr->sql_log_prefix);
     g_free(mgr->sql_log_path);
 
     g_free(mgr->sql_log_fullname);
@@ -243,8 +243,8 @@ static void sql_log_check_rotate(struct sql_log_mgr *mgr) {
     struct tm cur_tm;
     localtime_r(&t, &cur_tm);
 
-    gchar *rotate_filename = g_strdup_printf("%s/%s_%04d%02d%02d%02d%02d%02d.%s",
-            mgr->sql_log_path, mgr->sql_log_filename,
+    gchar *rotate_filename = g_strdup_printf("%s/%s-%d-%04d%02d%02d%02d%02d%02d.%s",
+            mgr->sql_log_path, mgr->sql_log_prefix, getpid(),
             cur_tm.tm_year + 1900, cur_tm.tm_mon + 1, cur_tm.tm_mday, cur_tm.tm_hour,
             cur_tm.tm_min, cur_tm.tm_sec, SQL_LOG_DEF_SUFFIX);
     if (!rotate_filename) {
@@ -278,7 +278,10 @@ static void sql_log_check_rotate(struct sql_log_mgr *mgr) {
         mgr->sql_log_action = SQL_LOG_STOP;
         return NULL;
     }
-    fstat(fileno(mgr->sql_log_fp), &st);
+    gint rst = fstat(fileno(mgr->sql_log_fp), &st);
+    if (rst != 0) {
+        g_message("fstat() failed in sql_log_mainloop");
+    }
     mgr->sql_log_cursize = st.st_size;
     g_message("sql log thread started");
     mgr->sql_log_action = SQL_LOG_START;
@@ -336,22 +339,20 @@ sql_log_thread_start(struct sql_log_mgr *mgr) {
      if (mgr->sql_log_bufsize == 0) {
          mgr->sql_log_bufsize = SQL_LOG_BUFFER_DEF_SIZE;
      }
-     if (mgr->sql_log_filename == NULL) {
-         mgr->sql_log_filename = g_strdup(SQL_LOG_DEF_FILE_NAME);
+     if (mgr->sql_log_prefix == NULL) {
+         mgr->sql_log_prefix = g_strdup(SQL_LOG_DEF_FILE_PREFIX);
      }
      if (mgr->sql_log_path == NULL) {
          mgr->sql_log_path = g_strdup(SQL_LOG_DEF_PATH);
      }
-     int result = access(mgr->sql_log_path, F_OK);
-     if (result != 0) {
-         g_message("sql log path is not exist, try to mkdir");
-         result = mkdir(mgr->sql_log_path, 0660);
-         if (result != 0) {
-             g_message("mkdir(%s) failed", mgr->sql_log_path);
-         }
+     gint result = mkdir(mgr->sql_log_path, 0770);
+     if (!result) {
+         g_message("sql log path maybe exist, try to mkdir failed");
+     } else {
+         g_message("sql log path is not exist, try to mkdir success");
      }
      if (mgr->sql_log_fullname == NULL) {
-         mgr->sql_log_fullname = g_strdup_printf("%s/%s.%s", mgr->sql_log_path, mgr->sql_log_filename, SQL_LOG_DEF_SUFFIX);
+         mgr->sql_log_fullname = g_strdup_printf("%s/%s-%d.%s", mgr->sql_log_path, mgr->sql_log_prefix, getpid(), SQL_LOG_DEF_SUFFIX);
      }
      mgr->fifo = rfifo_alloc(mgr->sql_log_bufsize);
      mgr->sql_log_filelist = g_queue_new();
@@ -486,7 +487,7 @@ log_sql_backend_sharding(network_mysqld_con *con, server_session_t *session)
                                               session->is_in_xa ==1 ? "true" : "false", com_dis_tras_state[xa_state],
                                               latency_ms, session->query_status == MYSQLD_PACKET_OK ? "OK" : "ERR",
                                               GET_COM_NAME(con->parse.command),//type
-                                              con->parse.command == 23 ? "" : (session->sql != NULL ? session->sql->str : ""));//sql
+                                              con->parse.command == COM_STMT_EXECUTE ? "" : (session->sql != NULL ? session->sql->str : ""));//sql
      }
      rfifo_write(mgr->fifo, message->str, message->len);
      g_string_free(message, TRUE);

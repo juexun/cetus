@@ -61,6 +61,7 @@
 "user_pwd" return TK_USER_PWD;
 "app_user_pwd" return TK_APP_USER_PWD;
 "allow_ip" return TK_ALLOW_IP;
+"deny_ip" return TK_DENY_IP;
 "conn_details" return TK_CONN_DETAILS;
 "version" return TK_VERSION;
 "get" return TK_GET;
@@ -99,6 +100,8 @@
 "LOG" return TK_LOG;
 "START" return TK_START;
 "STOP" return TK_STOP;
+"KILL" return TK_KILL;
+"QUERY" return TK_QUERY;
 
 [0-9]+                 return TK_INTEGER; /*sign symbol is handled in parser*/
 
