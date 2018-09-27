@@ -27,16 +27,9 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <unistd.h>
 #include <ctype.h>
 #include <glib/gstdio.h>        /* for g_stat */
-
-enum chassis_config_type_t {
-    CHASSIS_CONF_SSH,
-    CHASSIS_CONF_FTP,
-    CHASSIS_CONF_MYSQL,
-    CHASSIS_CONF_SQLITE,
-    CHASSIS_CONF_LOCAL,         /* maybe unify local directory? */
-};
 
 #define RF_MAX_NAME_LEN 128
 struct config_object_t {
@@ -54,28 +47,6 @@ config_object_free(struct config_object_t *ob)
         g_free(ob->cache);
     g_free(ob);
 }
-
-struct chassis_config_t {
-    enum chassis_config_type_t type;
-    char *user;
-    char *password;
-    char *host;
-    int port;
-    char *schema;
-
-/* this mysql conn might be used in 2 threads,
- * on startup, the main thread use it to load config
- * while running, the monitor thread use it periodically
- * for now, it is guaranteed not used simutaneously, so it's not locked
- */
-    MYSQL *mysql_conn;
-
-    char *options_table;
-    char *options_filter;
-    GHashTable *options;
-
-    GList *objects;
-};
 
 static gboolean
 url_parse_user_pass(chassis_config_t *rconf, const char *userpass, int len)
@@ -164,6 +135,9 @@ chassis_config_parse_mysql_url(chassis_config_t *rconf, const char *url, int len
 static MYSQL *
 chassis_config_get_mysql_connection(chassis_config_t *conf)
 {
+    g_debug("%s:call chassis_config_get_mysql_connection", G_STRLOC);
+    /* TODO could not use cache connection */
+    conf->mysql_conn = NULL;
     /* first try the cached connection */
     if (conf->mysql_conn) {
         if (mysql_ping(conf->mysql_conn) == 0) {
@@ -174,6 +148,7 @@ chassis_config_get_mysql_connection(chassis_config_t *conf)
         }
     }
 
+    g_debug("%s:call mysql_init", G_STRLOC);
     MYSQL *conn = mysql_init(NULL);
     if (!conn)
         return NULL;
@@ -183,6 +158,7 @@ chassis_config_get_mysql_connection(chassis_config_t *conf)
     mysql_options(conn, MYSQL_OPT_READ_TIMEOUT, &timeout);
     mysql_options(conn, MYSQL_OPT_WRITE_TIMEOUT, &timeout);
 
+    g_debug("%s:call mysql_real_connect", G_STRLOC);
     if (mysql_real_connect(conn, conf->host, conf->user, conf->password, NULL, conf->port, NULL, 0) == NULL) {
         g_critical("%s", mysql_error(conn));
         mysql_close(conn);
@@ -395,6 +371,7 @@ static gboolean
 chassis_config_mysql_query_object(chassis_config_t *conf,
                                   struct config_object_t *object, const char *name, char **json_res)
 {
+    g_debug("%s:reach mysql_query", G_STRLOC);
     g_assert(conf->type == CHASSIS_CONF_MYSQL);
     if (object->cache) {
         *json_res = g_strdup(object->cache);
@@ -408,6 +385,8 @@ chassis_config_mysql_query_object(chassis_config_t *conf,
         g_warning("Cannot connect to mysql server.");
         goto mysql_error;
     }
+        
+    g_debug("%s:reach mysql_query", G_STRLOC);
     char sql[256] = { 0 };
     snprintf(sql, sizeof(sql), "SELECT object_value,mtime FROM %s.objects where object_name='%s'", conf->schema, name);
     if (mysql_query(conn, sql)) {
@@ -415,12 +394,15 @@ chassis_config_mysql_query_object(chassis_config_t *conf,
         goto mysql_error;
     }
     MYSQL_RES *result = mysql_store_result(conn);
-    if (!result)
+    if (!result) { 
+        g_debug("%s:reach mysql_store_result, result:%s", G_STRLOC, sql);
         goto mysql_error;
+    }
 
     MYSQL_ROW row;
     row = mysql_fetch_row(result);
     if (!row) {
+        g_debug("%s:reach mysql_fetch_row", G_STRLOC);
         mysql_free_result(result);
         goto mysql_error;
     }
@@ -479,8 +461,11 @@ chassis_config_query_object(chassis_config_t *conf, const char *name, char **jso
         object = g_new0(struct config_object_t, 1);
         strncpy(object->name, name, RF_MAX_NAME_LEN - 1);
         conf->objects = g_list_append(conf->objects, object);
+    } else {
+        g_critical(G_STRLOC ": object is nil, name:%s", name);
     }
 
+    g_debug(G_STRLOC ": config type:%d", conf->type);
     switch (conf->type) {
     case CHASSIS_CONF_MYSQL:
         return chassis_config_mysql_query_object(conf, object, name, json_res);
@@ -751,7 +736,7 @@ chassis_config_register_service(chassis_config_t *conf, char *id, char *data)
 void
 chassis_config_unregister_service(chassis_config_t *conf, char *id)
 {
-    if (conf->type != CHASSIS_CONF_MYSQL)
+    if (conf == NULL || conf->type != CHASSIS_CONF_MYSQL)
         return;
 
     MYSQL *conn = chassis_config_get_mysql_connection(conf);
@@ -766,4 +751,50 @@ chassis_config_unregister_service(chassis_config_t *conf, char *id)
         g_critical("%s", mysql_error(conn));
         return;
     }
+}
+
+gboolean
+chassis_config_reload_variables(chassis_config_t *conf, const char *name, char **json_res)
+{
+    if (conf->type != CHASSIS_CONF_MYSQL) {
+        return FALSE;
+    }
+
+    gboolean status = FALSE;
+    MYSQL *conn = chassis_config_get_mysql_connection(conf);
+
+    if (!conn) {
+        g_warning("Cannot connect to mysql server when reload variables");
+        goto mysql_error;
+    }
+    char sql[256] = { 0 };
+    snprintf(sql, sizeof(sql), "SELECT object_value,mtime FROM %s.objects where object_name='%s'", conf->schema, name);
+    if (mysql_query(conn, sql)) {
+        g_warning("sql failed: %s, when reload variables, mysql_errno: %d", sql, mysql_errno(conn));
+        goto mysql_error;
+    }
+    MYSQL_RES *result = mysql_store_result(conn);
+    if (!result)
+        goto mysql_error;
+
+    MYSQL_ROW row;
+    row = mysql_fetch_row(result);
+    if (!row) {
+        mysql_free_result(result);
+        goto mysql_error;
+    }
+
+    *json_res = g_strdup(row[0]);
+    time_t mt = chassis_epoch_from_string(row[1], NULL);
+
+    struct config_object_t *object = chassis_config_get_object(conf, name);
+    if (!object) {
+        mysql_free_result(result);
+        goto mysql_error;
+    }
+    chassis_config_object_set_cache(object, row[0], mt);
+    mysql_free_result(result);
+    status = TRUE;
+mysql_error:
+    return status;
 }

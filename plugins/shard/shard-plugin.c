@@ -197,12 +197,15 @@ check_backends_attr_changed(network_mysqld_con *con)
     for (i = 0; i < con->servers->len; i++) {
         server_session_t *ss = g_ptr_array_index(con->servers, i);
         if (ss->backend->type != con->last_backends_type[i]) {
+            g_message("%s backend type:%d, record type:%d",
+                    G_STRLOC, ss->backend->type, con->last_backends_type[i]);
             server_attr_changed = 1;
             break;
         }
 
         if (ss->backend->state != BACKEND_STATE_UP && ss->backend->state != BACKEND_STATE_UNKNOWN) {
             server_attr_changed = 1;
+            g_message("%s backend state:%d", G_STRLOC, ss->backend->state);
         }
     }
 
@@ -261,7 +264,7 @@ NETWORK_MYSQLD_PLUGIN_PROTO(proxy_read_query)
             } else {
                 network_mysqld_con_send_error(con->client, C("(proxy) unable to continue processing command"));
                 rc = PROXY_SEND_RESULT;
-                con->server_to_be_closed = 1;
+                network_mysqld_con_clear_xa_env_when_not_expected(con);
                 g_message("%s server attr changed", G_STRLOC);
             }
         }
@@ -383,7 +386,7 @@ explain_shard_sql(network_mysqld_con *con, sharding_plan_t *plan)
 
     shard_plugin_con_t *st = con->plugin_con_state;
 
-    rv = sharding_parse_groups(con->client->default_db, st->sql_context, &(con->srv->query_stats), con->id, plan);
+    rv = sharding_parse_groups(con->client->default_db, st->sql_context, &(con->srv->query_stats), con->key, plan);
 
     con->modified_sql = sharding_modify_sql(st->sql_context, &(con->hav_condi));
     if (con->modified_sql) {
@@ -463,7 +466,7 @@ analysis_query(network_mysqld_con *con, mysqld_query_attr_t *query_attr)
         sql_select_t *select = (sql_select_t *)context->sql_statement;
 
         if (con->could_be_tcp_streamed) {
-            if (sql_expr_list_find_aggregate(select->columns)) {
+            if (sql_expr_list_find_aggregate(select->columns, NULL) != -1) {
                 con->could_be_tcp_streamed = 0;
                 g_debug("%s: con tcp stream false", G_STRLOC);
             }
@@ -823,7 +826,7 @@ process_init_db_when_get_server_list(network_mysqld_con *con, sharding_plan_t *p
     } else {
         name_len = name_len - 1;
         network_mysqld_proto_get_str_len(&packet, &db_name, name_len);
-        shard_conf_get_fixed_group(groups, con->id);
+        shard_conf_get_fixed_group(groups, con->key);
     }
 
     if (groups->len > 0) {      /* has database */
@@ -1190,7 +1193,7 @@ proxy_get_server_list(network_mysqld_con *con)
         break;
     default:
         rv = sharding_parse_groups(con->client->default_db, st->sql_context,
-                                   stats, con->id, plan);
+                                   stats, con->key, plan);
         break;
     }
 
@@ -1294,6 +1297,11 @@ proxy_get_pooled_connection(network_mysqld_con *con,
     if (type == BACKEND_TYPE_RW) {
         backend = backend_group->master;    /* may be NULL if master down */
         if (!backend || (backend->state != BACKEND_STATE_UP && backend->state != BACKEND_STATE_UNKNOWN)) {
+            if (backend) {
+                g_message("%s: backend->state:%d", G_STRLOC, backend->state);
+            } else {
+                g_message("%s: backend is nil", G_STRLOC);
+            }
             *server_unavailable = 1;
             return FALSE;
         }
@@ -1313,6 +1321,7 @@ proxy_get_pooled_connection(network_mysqld_con *con,
             con->slave_conn_shortaged = 1;
         }
 
+        g_message("%s: conn shortaged, type:%d", G_STRLOC, type);
         return FALSE;
     }
 
@@ -1679,7 +1688,7 @@ check_user_consistant(network_mysqld_con *con)
 static void
 build_xa_end_command(network_mysqld_con *con, server_session_t *ss, int first)
 {
-    char buffer[64];
+    char buffer[XA_CMD_BUF_LEN];
 
     snprintf(buffer, sizeof(buffer), "XA END %s", con->xid_str);
 
@@ -2173,7 +2182,8 @@ show_proxy_read_only_backend_address(gpointer param) {
         guint i;
         for (i = 0; i < bs->backends->len; i++) {
             network_backend_t *old_backend = g_ptr_array_index(bs->backends, i);
-            if(old_backend && old_backend->type == BACKEND_TYPE_RO) {
+            if(old_backend && old_backend->type == BACKEND_TYPE_RO
+                    && old_backend->state != BACKEND_STATE_DELETED && old_backend->state != BACKEND_STATE_MAINTAINING) {
                 free_str = g_string_append(free_str, old_backend->address->str);
                 if(old_backend->server_group && old_backend->server_group->len) {
                     free_str = g_string_append(free_str, "@");
@@ -2202,7 +2212,8 @@ show_proxy_backend_addresses(gpointer param) {
         guint i;
         for (i = 0; i < bs->backends->len; i++) {
             network_backend_t *old_backend = g_ptr_array_index(bs->backends, i);
-            if(old_backend && old_backend->type == BACKEND_TYPE_RW) {
+            if(old_backend && old_backend->type == BACKEND_TYPE_RW
+                    && old_backend->state != BACKEND_STATE_DELETED && old_backend->state != BACKEND_STATE_MAINTAINING) {
                 free_str = g_string_append(free_str, old_backend->address->str);
                 if(old_backend->server_group && old_backend->server_group->len) {
                     free_str = g_string_append(free_str, "@");
@@ -2386,6 +2397,56 @@ assign_proxy_write_timeout(const gchar *newval, gpointer param) {
     return ret;
 }
 
+static gchar*
+show_proxy_allow_ip(gpointer param) {
+    gchar *ret = NULL;
+    struct external_param *opt_param = (struct external_param *)param;
+    gint opt_type = opt_param->opt_type;
+    GList *list = opt_param->chas->priv->acl->whitelist;
+    if(CAN_SAVE_OPTS_PROPERTY(opt_type)) {
+        GString *free_str = g_string_new(NULL);
+        GList *l = NULL;
+        for (l = list; l; l = l->next) {
+            struct cetus_acl_entry_t* entry = l->data;
+            free_str = g_string_append(free_str, entry->username);
+            free_str = g_string_append(free_str, "@");
+            free_str = g_string_append(free_str, entry->host);
+            free_str = g_string_append(free_str, ",");
+        }
+        if(free_str->len) {
+            free_str->str[free_str->len -1] = '\0';
+            ret = g_strdup(free_str->str);
+        }
+        g_string_free(free_str, TRUE);
+    }
+    return ret;
+}
+
+static gchar*
+show_proxy_deny_ip(gpointer param) {
+    gchar *ret = NULL;
+    struct external_param *opt_param = (struct external_param *)param;
+    gint opt_type = opt_param->opt_type;
+    GList *list = opt_param->chas->priv->acl->blacklist;
+    if(CAN_SAVE_OPTS_PROPERTY(opt_type)) {
+        GString *free_str = g_string_new(NULL);
+        GList *l = NULL;
+        for (l = list; l; l = l->next) {
+            struct cetus_acl_entry_t* entry = l->data;
+            free_str = g_string_append(free_str, entry->username);
+            free_str = g_string_append(free_str, "@");
+            free_str = g_string_append(free_str, entry->host);
+            free_str = g_string_append(free_str, ",");
+        }
+        if(free_str->len) {
+            free_str->str[free_str->len -1] = '\0';
+            ret = g_strdup(free_str->str);
+        }
+        g_string_free(free_str, TRUE);
+    }
+    return ret;
+}
+
 /**
  * plugin options
  */
@@ -2437,11 +2498,11 @@ network_mysqld_shard_plugin_get_options(chassis_plugin_config *config)
 
     chassis_options_add(&opts, "proxy-allow-ip",
                         0, 0, OPTION_ARG_STRING, &(config->allow_ip), "allow user@IP for proxy permission", NULL,
-                        NULL, NULL, SAVE_OPTS_PROPERTY);
+                        NULL, show_proxy_allow_ip, SAVE_OPTS_PROPERTY);
 
     chassis_options_add(&opts, "proxy-deny-ip",
                         0, 0, OPTION_ARG_STRING, &(config->deny_ip), "deny user@IP for proxy permission", NULL,
-                        NULL, NULL, SAVE_OPTS_PROPERTY);
+                        NULL, show_proxy_deny_ip, SAVE_OPTS_PROPERTY);
 
     return opts.options;
 }
@@ -2512,7 +2573,7 @@ network_mysqld_shard_plugin_apply_config(chassis *chas, chassis_plugin_config *c
         return -1;
     }
 
-    if (network_socket_bind(listen_sock)) {
+    if (network_socket_bind(listen_sock, 1)) {
         return -1;
     }
     g_message("shard module listening on port %s, con:%p", config->address, con);
@@ -2564,6 +2625,18 @@ network_mysqld_shard_plugin_apply_config(chassis *chas, chassis_plugin_config *c
     return 0;
 }
 
+static void 
+network_mysqld_shard_plugin_stop_listening(chassis *chas,
+        chassis_plugin_config *config)
+{
+    if (config->listen_con) {
+        g_message("%s:close listen socket", G_STRLOC);
+        network_socket_free(config->listen_con->server);
+        config->listen_con = NULL;
+    }
+}
+
+
 G_MODULE_EXPORT int
 plugin_init(chassis_plugin *p)
 {
@@ -2574,6 +2647,7 @@ plugin_init(chassis_plugin *p)
     p->init = network_mysqld_shard_plugin_new;
     p->get_options = network_mysqld_shard_plugin_get_options;
     p->apply_config = network_mysqld_shard_plugin_apply_config;
+    p->stop_listening = network_mysqld_shard_plugin_stop_listening;
     p->destroy = network_mysqld_shard_plugin_free;
 
     return 0;

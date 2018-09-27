@@ -52,13 +52,14 @@
 #include "network-backend.h"
 #include "cetus-error.h"
 
-#define XID_LEN 64
+#define XID_LEN 128
 #define COMPRESS_BUF_SIZE 1048576
 
 typedef enum {
     PROXY_NO_DECISION,
     PROXY_NO_CONNECTION,        /* TODO: this one shouldn't be here, it's not a dicsion */
     PROXY_SEND_QUERY,
+    PROXY_WAIT_QUERY_RESULT,
     PROXY_SEND_RESULT,
     PROXY_SEND_INJECTION,
     PROXY_SEND_NONE,
@@ -175,6 +176,8 @@ typedef struct {
      * which probably is a deficiency.
      */
     NETWORK_MYSQLD_PLUGIN_FUNC(con_cleanup);
+
+    NETWORK_MYSQLD_PLUGIN_FUNC(con_exectute_sql);
 
     NETWORK_MYSQLD_PLUGIN_FUNC(con_timeout);
 } network_mysqld_hooks;
@@ -352,7 +355,6 @@ typedef enum {
 typedef enum {
     RM_SUCCESS,
     RM_FAIL,
-    RM_CALL_FAIL
 } result_merge_status_t;
 
 typedef struct result_merge_t {
@@ -364,6 +366,7 @@ typedef struct having_condition_t {
     int rel_type;
     int data_type;
     char *condition_value;
+    int column_index;
 } having_condition_t;
 
 typedef struct mysqld_query_attr_t {
@@ -510,7 +513,7 @@ struct network_mysqld_con {
     int num_servers_visited;
     int num_write_pending;
     int num_read_pending;
-    guint64 id; /* session id */
+    unsigned int key;
 
     mysqld_query_attr_t query_attr;
 
@@ -565,8 +568,13 @@ struct network_mysqld_con {
     unsigned int query_cache_judged:1;
     unsigned int is_client_compressed:1;
     unsigned int is_admin_client:1;
+    unsigned int direct_answer:1;
+    unsigned int admin_read_merge:1;
+    unsigned int ask_one_worker:1;
+    unsigned int ask_the_given_worker:1;
     unsigned int is_client_to_be_closed:1;
     unsigned int last_backend_type:2;
+    unsigned int process_index:6;
     unsigned int all_participate_num:8;
 
     unsigned long long xa_id;
@@ -737,7 +745,7 @@ NETWORK_API void network_mysqld_con_reset_query_state(network_mysqld_con *con);
  * should be socket 
  */
 NETWORK_API network_socket_retval_t network_mysqld_read(chassis *srv, network_socket *con);
-NETWORK_API network_socket_retval_t network_mysqld_write(chassis *srv, network_socket *con);
+NETWORK_API network_socket_retval_t network_mysqld_write(network_socket *con);
 NETWORK_API network_socket_retval_t network_mysqld_con_get_packet(chassis G_GNUC_UNUSED *chas, network_socket *con);
 
 struct chassis_private {
@@ -748,6 +756,7 @@ struct chassis_private {
     struct cetus_variable_t *stats_variables;
     struct cetus_monitor_t *monitor;
     guint32 thread_id;
+    guint32 max_thread_id;
     struct cetus_acl_t *acl;
 };
 
@@ -759,11 +768,12 @@ NETWORK_API void send_part_content_to_client(network_mysqld_con *con);
 NETWORK_API void set_conn_attr(network_mysqld_con *con, network_socket *server);
 NETWORK_API int network_mysqld_init(chassis *srv);
 NETWORK_API void network_mysqld_add_connection(chassis *srv, network_mysqld_con *con, gboolean listen);
-gboolean network_mysqld_kill_connection(chassis *srv, guint64 id);
+gboolean network_mysqld_kill_connection(chassis *srv, guint32 id);
 NETWORK_API void network_mysqld_con_handle(int event_fd, short events, void *user_data);
 NETWORK_API int network_mysqld_queue_append(network_socket *sock, network_queue *queue, const char *data, size_t len);
 NETWORK_API int network_mysqld_queue_append_raw(network_socket *sock, network_queue *queue, GString *data);
 NETWORK_API int network_mysqld_queue_reset(network_socket *sock);
+NETWORK_API void network_mysqld_con_clear_xa_env_when_not_expected(network_mysqld_con *con);
 
 NETWORK_API void network_connection_pool_create_conn(network_mysqld_con *con);
 NETWORK_API void network_connection_pool_create_conns(chassis *srv);

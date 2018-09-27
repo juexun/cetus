@@ -43,8 +43,7 @@ enum {
     ASSIGN_NOT_SUPPORT,
     ASSIGN_VALUE_INVALID,
     SAVE_ERROR,
-    RENAME_ERROR,
-    CHMOD_ERROR
+    CHANGE_SAVE_ERROR
 };
 
 /* show utils */
@@ -65,8 +64,10 @@ CHASSIS_API gchar* show_max_open_files(gpointer param);
 CHASSIS_API gchar* show_default_charset(gpointer param);
 CHASSIS_API gchar* show_default_username(gpointer param);
 CHASSIS_API gchar* show_default_db(gpointer param);
+CHASSIS_API gchar* show_ifname(gpointer param);
 CHASSIS_API gchar* show_default_pool_size(gpointer param);
 CHASSIS_API gchar* show_max_pool_size(gpointer param);
+CHASSIS_API gchar* show_worker_processes(gpointer param);
 CHASSIS_API gchar* show_max_resp_len(gpointer param);
 CHASSIS_API gchar* show_max_alive_time(gpointer param);
 CHASSIS_API gchar* show_merged_output_size(gpointer param);
@@ -107,8 +108,10 @@ CHASSIS_API gint assign_log_level(const gchar *newval, gpointer param);
 CHASSIS_API gint assign_default_charset(const gchar *newval, gpointer param);
 CHASSIS_API gint assign_default_username(const gchar *newval, gpointer param);
 CHASSIS_API gint assign_default_db(const gchar *newval, gpointer param);
+CHASSIS_API gint assign_ifname(const gchar *newval, gpointer param);
 CHASSIS_API gint assign_default_pool_size(const gchar *newval, gpointer param);
 CHASSIS_API gint assign_max_pool_size(const gchar *newval, gpointer param);
+CHASSIS_API gint assign_worker_processes(const gchar *newval, gpointer param);
 CHASSIS_API gint assign_max_resp_len(const gchar *newval, gpointer param);
 CHASSIS_API gint assign_max_alive_time(const gchar *newval, gpointer param);
 CHASSIS_API gint assign_merged_output_size(const gchar *newval, gpointer param);

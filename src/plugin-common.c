@@ -75,6 +75,8 @@ typedef int socklen_t;
 
 #define MAX_CACHED_ITEMS 65536
 
+extern int      cetus_last_process;
+
 /* judge if client_ip_with_username is in allow or deny ip_table*/
 static gboolean
 client_ip_table_lookup(GHashTable *ip_table, char *client_ip_with_username)
@@ -418,6 +420,11 @@ do_connect_cetus(network_mysqld_con *con, network_backend_t **backend, int *back
     g_string_free(version, FALSE);
     challenge->thread_id = g->thread_id++;
 
+    if (g->thread_id > g->max_thread_id) {
+        g->thread_id = 1 + (cetus_last_process << 24);
+        g_message("%s: rewind first thread id:%d", G_STRLOC, g->thread_id);
+    }
+
     GString *auth_packet = g_string_new(NULL);
     network_mysqld_proto_append_auth_challenge(auth_packet, challenge);
 
@@ -446,16 +453,18 @@ plugin_add_backends(chassis *chas, gchar **backend_addresses, gchar **read_only_
 
     GPtrArray *backends_arr = g->backends->backends;
     for (i = 0; backend_addresses[i]; i++) {
-        if (-1 == network_backends_add(g->backends, backend_addresses[i], BACKEND_TYPE_RW, BACKEND_STATE_UNKNOWN, chas)) {
-            return -1;
+        if (BACKEND_OPERATE_SUCCESS != network_backends_add(g->backends, backend_addresses[i], BACKEND_TYPE_RW, BACKEND_STATE_UNKNOWN, chas)) {
+            g_critical("add rw node: %s failed.", backend_addresses[i]);
+            continue;
         }
         network_backend_init_extra(backends_arr->pdata[backends_arr->len - 1], chas);
     }
 
     for (i = 0; read_only_backend_addresses && read_only_backend_addresses[i]; i++) {
-        if (-1 == network_backends_add(g->backends,
+        if (BACKEND_OPERATE_SUCCESS != network_backends_add(g->backends,
                                        read_only_backend_addresses[i], BACKEND_TYPE_RO, BACKEND_STATE_UNKNOWN, chas)) {
-            return -1;
+            g_critical("add ro node: %s failed.", read_only_backend_addresses[i]);
+            continue;
         }
         /* set conn-pool config */
         network_backend_init_extra(backends_arr->pdata[backends_arr->len - 1], chas);
@@ -620,7 +629,7 @@ proxy_put_shard_conn_to_pool(network_mysqld_con *con)
             } else {
                 g_debug("%s: is_put_to_pool_allowed false here, server:%p, con:%p, num:%d",
                         G_STRLOC, server, con, (int)con->servers->len);
-                network_socket_free(server);
+                network_socket_send_quit_and_free(server);
                 if (!is_reduced) {
                     con->srv->complement_conn_flag = 1;
                 }

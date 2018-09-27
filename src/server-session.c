@@ -39,7 +39,7 @@ server_session_free(server_session_t *ss)
 {
     if (ss) {
         if (ss->server != NULL) {
-            network_socket_free(ss->server);
+            network_socket_send_quit_and_free(ss->server);
         }
 
         ss->sql = NULL;
@@ -244,7 +244,7 @@ process_write_event(network_mysqld_con *con, server_session_t *ss)
 {
     network_socket *sock = ss->server;
 
-    switch (network_mysqld_write(con->srv, sock)) {
+    switch (network_mysqld_write(sock)) {
     case NETWORK_SOCKET_SUCCESS:
         con->num_pending_servers++;
         con->num_servers_visited++;
@@ -407,6 +407,7 @@ process_after_read(network_mysqld_con *con, server_session_t *ss)
 void
 server_session_con_handler(int event_fd, short events, void *user_data)
 {
+    g_debug("%s:visit server_session_con_handler", G_STRLOC);
     server_session_t *ss = (server_session_t *)user_data;
     network_mysqld_con *con = ss->con;
     network_socket *sock = ss->server;

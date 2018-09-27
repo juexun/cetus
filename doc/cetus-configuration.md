@@ -1,6 +1,13 @@
 # 启动配置选项
 
 ## 常规配置
+### worker-processes
+
+Default: 1
+
+启动worker进程的数量，启动的数量最好小于等于cpu数目
+
+> worker-processes = 4
 
 ### daemon
 
@@ -28,7 +35,7 @@ Default: root
 
 Default: conf
 
-配置文件路径，包括：用户设置文件、变量处理配置文件、分库版本的分片规则配置文件、读写分离版本的启动配置文件和分库版本的启动配置文件。
+JSON配置文件路径，JSON文件包括包括：账号配置文件、变量处理配置文件、分库版本的分片规则配置文件
 
 > conf-dir = /usr/lib/cetus/conf
 
@@ -176,6 +183,7 @@ Default: : 600 (seconds)
 
 Default: 100
 
+每个worker进程启动时允许创建的连接数
 当前连接数不足此值时，会自动创建连接
 
 > default-pool-size = 200
@@ -184,7 +192,7 @@ Default: 100
 
 Default: default-pool-size * 2
 
-连接池的最大连接数，超过此数目的连接不会放入连接池
+每个worker进程允许创建的最大连接数，包括连接池里的空闲连接和正在使用的连接
 
 > max-pool-size = 300
 
@@ -242,9 +250,10 @@ Default: false
 
 ### worker_id
 
-自增guid的worker id，最大值为63最小值为1
+只针对分库版本有效
+不同cetus实例的id号必须是不一样，否则容易有冲突
 
-> worker_id = 4
+> worker_id = 1
 
 ## Admin配置
 
@@ -551,3 +560,13 @@ Default: false
 采用tcp stream来输出响应，规避内存炸裂等问题
 
 > enable-tcp-stream = true
+
+### ssl
+
+Default: false
+
+前端支持SSL连接。需要在 `--conf-dir` 中提供：
+- 私钥：`server-key.pem`
+- 公钥证书：`server-cert.pem`
+这两个文件可以使用[mysql工具生成](https://dev.mysql.com/doc/refman/8.0/en/creating-ssl-rsa-files-using-mysql.html)，
+生成之后拷贝到`conf-dir`目录，程序会按照这两个固定名称加载文件。

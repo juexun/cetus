@@ -389,8 +389,8 @@ gint
 check_hostname(network_backend_t *backend)
 {
      gint ret = 0;
-     gchar *p = NULL;
      if (!backend) return ret;
+
      gchar old_addr[INET_ADDRSTRLEN] = {""};
      inet_ntop(AF_INET, &(backend->addr->addr.ipv4.sin_addr), old_addr, sizeof(old_addr));
      if (0 != network_address_set_address(backend->addr, backend->address->str)) {
@@ -487,7 +487,7 @@ update_master_timestamp(int fd, short what, void *arg)
 
     /* Catch RW time 
      * Need a table to write from master and read from slave.
-     * CREATE TABLE `tb_heartbeat` (
+     * CREATE TABLE if not exists `tb_heartbeat` (
      *   `p_id` varchar(128) NOT NULL,
      *   `p_ts` timestamp(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
      *   PRIMARY KEY (`p_id`)

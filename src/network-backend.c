@@ -52,7 +52,6 @@ network_backend_new()
     b = g_new0(network_backend_t, 1);
 
     b->pool = network_connection_pool_new();
-    b->uuid = g_string_new(NULL);
     b->addr = network_address_new();
     b->server_group = g_string_new(NULL);
     b->address = g_string_new(NULL);
@@ -70,7 +69,6 @@ network_backend_free(network_backend_t *b)
     network_connection_pool_free(b->pool);
 
     network_address_free(b->addr);
-    g_string_free(b->uuid, TRUE);
     g_string_free(b->server_version, TRUE);
     g_string_free(b->server_group, TRUE);
 
@@ -215,7 +213,7 @@ network_backends_add(network_backends_t *bs, const gchar *address,
 
     if (0 != network_address_set_address(new_backend->addr, new_backend->address->str)) {
         network_backend_free(new_backend);
-        return -1;
+        return BACKEND_OPERATE_NETERR;
     }
 
     guint i;
@@ -227,8 +225,12 @@ network_backends_add(network_backends_t *bs, const gchar *address,
             network_backend_free(new_backend);
 
             g_critical("backend %s is already known!", address);
-            return -1;
+            return BACKEND_OPERATE_DUPLICATE;
         }
+    }
+
+    if (type == BACKEND_TYPE_RW && network_backend_check_available_rw(bs, new_backend->server_group)) {
+        return BACKEND_OPERATE_2MASTER;
     }
 
     g_ptr_array_add(bs->backends, new_backend);
@@ -241,7 +243,7 @@ network_backends_add(network_backends_t *bs, const gchar *address,
     network_backends_into_group(bs, new_backend);
     g_message("added %s backend: %s, state: %s", backend_type_t_str[type], address, backend_state_t_str[state]);
 
-    return 0;
+    return BACKEND_OPERATE_SUCCESS;
 }
 
 /**
@@ -470,6 +472,20 @@ network_group_add(network_group_t *gp, network_backend_t *backend)
         }
         gp->nslaves += 1;
         gp->slaves[gp->nslaves - 1] = backend;
+    } else if (backend->type == BACKEND_TYPE_UNKNOWN) {
+        if (gp->nunknown >= MAX_GROUP_SLAVES) {
+            g_critical("too many unknown for group");
+            return;
+        }
+        int i = 0;
+        for (i = 0; i < gp->nunknown; ++i) {
+            network_backend_t *slave = gp->unknown[i];
+            if (strleq(S(slave->addr->name), S(backend->addr->name))) {
+                return;
+            }
+        }
+        gp->nunknown += 1;
+        gp->unknown[gp->nunknown - 1] = backend;
     }
 }
 
@@ -488,6 +504,10 @@ network_group_update(network_group_t *gp)
         backends = g_list_append(backends, gp->slaves[i]);
     }
     gp->nslaves = 0;
+    for (i = 0; i < gp->nunknown; ++i) {
+        backends = g_list_append(backends, gp->unknown[i]);
+    }
+    gp->nunknown = 0;
 
     /* rearrange them into this group */
     GList *l;
@@ -624,4 +644,32 @@ network_backends_used_conns(network_backends_t *bs)
         sum += in_use;
     }
     return sum;
+}
+
+int
+network_backend_check_available_rw(network_backends_t *bs, GString *name)
+{
+    if (!name || name->len == 0) {
+        int i = 0;
+        int count = network_backends_count(bs);
+        for (i = 0; i < count; i++) {
+            network_backend_t *backend = network_backends_get(bs, i);
+            if ((BACKEND_TYPE_RW == backend->type) &&
+                backend->state != BACKEND_STATE_MAINTAINING && backend->state != BACKEND_STATE_DELETED) {
+                break;
+            }
+        }
+        return i < count ? 1 : 0;
+    } else {
+        network_group_t *group = network_backends_get_group(bs, name);
+        if (group == NULL) {
+            return 0;
+        }
+        network_backend_t *rw = group->master;
+        if (rw && rw->state != BACKEND_STATE_MAINTAINING && rw->state != BACKEND_STATE_DELETED) {
+            return 1;
+        } else {
+            return 0;
+        }
+    }
 }

@@ -2,12 +2,11 @@
 #define _GNU_SOURCE
 #endif
 
-#include "admin-commands.h"
-
 #include <ctype.h>
 #include <errno.h>
 #include <sys/stat.h>
 
+#include "admin-commands.h"
 #include "cetus-users.h"
 #include "cetus-util.h"
 #include "cetus-variable.h"
@@ -27,6 +26,9 @@
 #include "chassis-options-utils.h"
 #include "chassis-sql-log.h"
 #include "cetus-acl.h"
+
+static gint save_setting(chassis *srv, gint *effected_rows);
+static void send_result(network_socket *client, gint ret, gint affected);
 
 static const char *get_conn_xa_state_name(network_mysqld_con_dist_tran_state_t state) {
     switch (state) {
@@ -67,15 +69,26 @@ void admin_clear_error(network_mysqld_con* con)
 {
     *(int*)(con->plugin_con_state) = 0;
 }
-void admin_select_all_backends(network_mysqld_con* admin_con)
+void admin_select_all_backends(network_mysqld_con* con)
 {
-    chassis *chas = admin_con->srv;
+    if (con->is_admin_client) {
+        con->admin_read_merge = 1;
+        return;
+    }
+    chassis *chas = con->srv;
     chassis_private *priv = chas->priv;
-    chassis_plugin_config *config = admin_con->config;
+    chassis_plugin_config *config = con->config;
+
     GPtrArray *fields = g_ptr_array_new_with_free_func(
         (GDestroyNotify)network_mysqld_proto_fielddef_free);
 
     MYSQL_FIELD *field;
+    
+    field = network_mysqld_proto_fielddef_new();
+    field->name = g_strdup("PID");
+    field->type = MYSQL_TYPE_STRING;
+    g_ptr_array_add(fields, field);
+
     field = network_mysqld_proto_fielddef_new();
     field->name = g_strdup("backend_ndx");
     field->type = MYSQL_TYPE_STRING;
@@ -98,11 +111,6 @@ void admin_select_all_backends(network_mysqld_con* admin_con)
 
     field = network_mysqld_proto_fielddef_new();
     field->name = g_strdup("slave delay");
-    field->type = MYSQL_TYPE_STRING;
-    g_ptr_array_add(fields, field);
-
-    field = network_mysqld_proto_fielddef_new();
-    field->name = g_strdup("uuid");
     field->type = MYSQL_TYPE_STRING;
     g_ptr_array_add(fields, field);
 
@@ -138,12 +146,16 @@ void admin_select_all_backends(network_mysqld_con* admin_con)
     static char *states[] = {"unknown", "up", "down", "maintaining", "deleted"};
     static char *types[] = {"unknown", "rw", "ro"};
 
+    cetus_pid_t process_id = getpid();
+
     for (i = 0; i < len; i++) {
         network_backend_t *backend = bs->backends->pdata[i];
         GPtrArray *row = g_ptr_array_new_with_free_func(g_free);
 
-        sprintf(buffer, "%d", i + 1);
+        sprintf(buffer, "%d", process_id);
+        g_ptr_array_add(row, g_strdup(buffer));
 
+        sprintf(buffer, "%d", i + 1);
         g_ptr_array_add(row, g_strdup(buffer));
 
         g_ptr_array_add(row, g_strdup(backend->addr->name->str));
@@ -152,8 +164,6 @@ void admin_select_all_backends(network_mysqld_con* admin_con)
 
         sprintf(buffer, "%d", backend->slave_delay_msec);
         g_ptr_array_add(row, (backend->type == BACKEND_TYPE_RO && chas->check_slave_delay == 1) ? g_strdup(buffer) : NULL);
-
-        g_ptr_array_add(row, backend->uuid->len ? g_strdup(backend->uuid->str) : NULL);
 
         sprintf(buffer, "%d", backend->pool->cur_idle_connections); 
         g_ptr_array_add(row, g_strdup(buffer));
@@ -170,16 +180,21 @@ void admin_select_all_backends(network_mysqld_con* admin_con)
 
     }
 
-    network_mysqld_con_send_resultset(admin_con->client, fields, rows);
+    network_mysqld_con_send_resultset(con->client, fields, rows);
 
     /* Free data */
     g_ptr_array_free(rows, TRUE);
     g_ptr_array_free(fields, TRUE);
 }
 
-void admin_select_conn_details(network_mysqld_con *admin_con)
+void admin_select_conn_details(network_mysqld_con *con)
 {
-    chassis *chas = admin_con->srv;
+    if (con->is_admin_client) {
+        con->admin_read_merge = 1;
+        return;
+    }
+
+    chassis *chas = con->srv;
     chassis_private *priv = chas->priv;
 
     int i, j, len;
@@ -287,6 +302,12 @@ void admin_select_conn_details(network_mysqld_con *admin_con)
     fields = g_ptr_array_new_with_free_func((void *) network_mysqld_proto_fielddef_free);
 
     field = network_mysqld_proto_fielddef_new();
+    field->name = g_strdup("PID");
+    field->type = MYSQL_TYPE_STRING;
+    g_ptr_array_add(fields, field);
+
+
+    field = network_mysqld_proto_fielddef_new();
     field->name = g_strdup("backend_ndx");
     field->type = MYSQL_TYPE_STRING;
     g_ptr_array_add(fields, field);
@@ -314,6 +335,9 @@ void admin_select_conn_details(network_mysqld_con *admin_con)
     rows = g_ptr_array_new_with_free_func((void *) network_mysqld_mysql_field_row_free);
 
     len = bs->backends->len;
+
+    cetus_pid_t process_id = getpid();
+    
     for (i = 0; i < len; i++) {
         network_backend_t *backend = bs->backends->pdata[i];
         
@@ -334,6 +358,9 @@ void admin_select_conn_details(network_mysqld_con *admin_con)
             /* count all users' pooled connections */
             while (g_hash_table_iter_next(&iter, (void **)&key, (void **)&queue)) {
                 row = g_ptr_array_new_with_free_func(g_free);
+
+                sprintf(buffer, "%d", process_id);
+                g_ptr_array_add(row, g_strdup(buffer));
 
                 sprintf(buffer, "%d", i); 
                 g_ptr_array_add(row, g_strdup(buffer));
@@ -361,7 +388,7 @@ void admin_select_conn_details(network_mysqld_con *admin_con)
         }
     }
 
-    network_mysqld_con_send_resultset(admin_con->client, fields, rows);
+    network_mysqld_con_send_resultset(con->client, fields, rows);
 
     /* Free data */
     g_ptr_array_free(rows, TRUE);
@@ -370,13 +397,23 @@ void admin_select_conn_details(network_mysqld_con *admin_con)
     g_hash_table_destroy(back_user_conn_hash_table);
 }
 
-void admin_show_connectionlist(network_mysqld_con *admin_con, int show_count)
+void admin_show_connectionlist(network_mysqld_con *con, int show_count)
 {
-    int number = show_count==-1 ? 65536 : show_count;
+    if (con->is_admin_client) {
+        con->admin_read_merge = 1;
+        return;
+    }
 
-    chassis *chas = admin_con->srv;
+    int number = 256;
+
+    if (show_count > 0) {
+        if (show_count < 256) {
+            number = show_count;
+        }
+    }
+    chassis *chas = con->srv;
     chassis_private *priv = chas->priv;
-    chassis_plugin_config *config = admin_con->config;
+    chassis_plugin_config *config = con->config;
     int i, len;
     char buffer[32];
     GPtrArray *fields;
@@ -387,7 +424,12 @@ void admin_show_connectionlist(network_mysqld_con *admin_con, int show_count)
     fields = g_ptr_array_new_with_free_func((void *) network_mysqld_proto_fielddef_free);
 
     field = network_mysqld_proto_fielddef_new();
-    field->name = g_strdup("Id");
+    field->name = g_strdup("PID");
+    field->type = MYSQL_TYPE_STRING;
+    g_ptr_array_add(fields, field);
+
+    field = network_mysqld_proto_fielddef_new();
+    field->name = g_strdup("ThreadID");
     field->type = MYSQL_TYPE_STRING;
     g_ptr_array_add(fields, field);
 
@@ -460,6 +502,8 @@ void admin_show_connectionlist(network_mysqld_con *admin_con, int show_count)
     len = priv->cons->len;
     int count = 0;
 
+    cetus_pid_t process_id = getpid();
+
     for (i = 0; i < len; i++) {
         network_mysqld_con *con = priv->cons->pdata[i];
 
@@ -474,7 +518,17 @@ void admin_show_connectionlist(network_mysqld_con *admin_con, int show_count)
         count++;
 
         row = g_ptr_array_new_with_free_func(g_free);
-        g_ptr_array_add(row, g_strdup_printf("%lu", con->id));
+
+        sprintf(buffer, "%d", process_id);
+        g_ptr_array_add(row, g_strdup(buffer));
+
+        if (con->client->challenge)  {
+            sprintf(buffer, "%d", con->client->challenge->thread_id);
+            g_ptr_array_add(row, g_strdup(buffer));
+        } else {
+            g_ptr_array_add(row, NULL);
+        }
+
         if (con->client->response != NULL) {
             g_ptr_array_add(row, g_strdup(con->client->response->username->str));
         } else {
@@ -556,7 +610,7 @@ void admin_show_connectionlist(network_mysqld_con *admin_con, int show_count)
         g_ptr_array_add(rows, row);
     }
 
-    network_mysqld_con_send_resultset(admin_con->client, fields, rows);
+    network_mysqld_con_send_resultset(con->client, fields, rows);
 
     g_ptr_array_free(rows, TRUE);
     g_ptr_array_free(fields, TRUE);
@@ -598,6 +652,27 @@ void admin_show_connectionlist(network_mysqld_con *admin_con, int show_count)
     g_ptr_array_add(fields, field);  \
     }while(0)
 
+#define MAKE_FIELD_DEF_4_COL(fields, col1_name, col2_name, col3_name, col4_name)   \
+    do {\
+    MYSQL_FIELD *field = network_mysqld_proto_fielddef_new();\
+    field->name = g_strdup((col1_name));                      \
+    field->type = FIELD_TYPE_VAR_STRING;\
+    g_ptr_array_add(fields, field);         \
+    field = network_mysqld_proto_fielddef_new();     \
+    field->name = g_strdup((col2_name));                      \
+    field->type = FIELD_TYPE_VAR_STRING;\
+    g_ptr_array_add(fields, field);         \
+    field = network_mysqld_proto_fielddef_new();     \
+    field->name = g_strdup((col3_name));                      \
+    field->type = FIELD_TYPE_VAR_STRING;\
+    g_ptr_array_add(fields, field);  \
+    field = network_mysqld_proto_fielddef_new();     \
+    field->name = g_strdup((col4_name));                      \
+    field->type = FIELD_TYPE_VAR_STRING;\
+    g_ptr_array_add(fields, field);  \
+    }while(0)
+
+
 #define APPEND_ROW_1_COL(rows, row_data) \
     do {\
     GPtrArray* row = g_ptr_array_new();\
@@ -622,9 +697,23 @@ void admin_show_connectionlist(network_mysqld_con *admin_con, int show_count)
     g_ptr_array_add(rows, row);\
     }while(0)
 
+#define APPEND_ROW_4_COL(rows, col1, col2, col3, col4)    \
+    do {\
+    GPtrArray *row = g_ptr_array_new();\
+    g_ptr_array_add(row, (col1));  \
+    g_ptr_array_add(row, (col2));  \
+    g_ptr_array_add(row, (col3));  \
+    g_ptr_array_add(row, (col4));  \
+    g_ptr_array_add(rows, row);\
+    }while(0)
 
 void admin_acl_show_rules(network_mysqld_con *con, gboolean is_white)
 {
+    if (con->is_admin_client) {
+        con->ask_one_worker = 1;
+        con->admin_read_merge = 1;
+        return;
+    }
     GPtrArray *fields = network_mysqld_proto_fielddefs_new();
     MAKE_FIELD_DEF_2_COL(fields, "User", "Host");
 
@@ -646,18 +735,43 @@ void admin_acl_show_rules(network_mysqld_con *con, gboolean is_white)
 
 void admin_acl_add_rule(network_mysqld_con *con, gboolean is_white, char *addr)
 {
+    if (con->is_admin_client) {
+        return;
+    }
+
     chassis *chas = con->srv;
-    gboolean ok = cetus_acl_add_rule_str(chas->priv->acl,
+    int affected = cetus_acl_add_rule_str(chas->priv->acl,
                                          is_white?ACL_WHITELIST:ACL_BLACKLIST, addr);
-    network_mysqld_con_send_ok_full(con->client, ok, 0, SERVER_STATUS_AUTOCOMMIT, 0);
+    if(chas->config_manager->type == CHASSIS_CONF_MYSQL) {
+        network_mysqld_con_send_ok_full(con->client, affected,
+                                        0, SERVER_STATUS_AUTOCOMMIT, 0);        
+    } else {
+        gint ret = CHANGE_SAVE_ERROR;
+        gint effected_rows = 0;
+        if (affected)
+            ret = save_setting(chas, &effected_rows);
+        send_result(con->client, ret, affected);
+    }
 }
 
 void admin_acl_delete_rule(network_mysqld_con *con, gboolean is_white, char *addr)
 {
+    if (con->is_admin_client) {
+        return;
+    }
     chassis *chas = con->srv;
     int affected = cetus_acl_delete_rule_str(chas->priv->acl,
                                              is_white?ACL_WHITELIST:ACL_BLACKLIST, addr);
-    network_mysqld_con_send_ok_full(con->client, affected, 0, SERVER_STATUS_AUTOCOMMIT, 0);
+    if(chas->config_manager->type == CHASSIS_CONF_MYSQL) {
+        network_mysqld_con_send_ok_full(con->client, affected,
+                                        0, SERVER_STATUS_AUTOCOMMIT, 0);
+    } else {
+        gint ret = CHANGE_SAVE_ERROR;
+        gint effected_rows = 0;
+        if (affected)
+            ret = save_setting(chas, &effected_rows);
+        send_result(con->client, ret, affected);
+    }
 }
 
 /* only match % wildcard, case insensitive */
@@ -687,6 +801,12 @@ static GList* admin_get_all_options(chassis* chas)
 
 void admin_show_variables(network_mysqld_con* con, const char* like)
 {
+    if (con->is_admin_client) {
+        con->ask_one_worker = 1; 
+        con->admin_read_merge = 1;
+        return;
+    }
+
     const char* pattern = like ? like : "%";
     GList *options = admin_get_all_options(con->srv);
 
@@ -709,7 +829,8 @@ void admin_show_variables(network_mysqld_con* con, const char* like)
                 continue;
             }
             freelist = g_list_append(freelist, value);
-            APPEND_ROW_3_COL(rows, (char *)opt->long_name, value, (CAN_ASSIGN_OPTS_PROPERTY(opt->opt_property)? "Dynamic" : "Static"));
+            APPEND_ROW_3_COL(rows, (char *)opt->long_name, value,
+                    (CAN_ASSIGN_OPTS_PROPERTY(opt->opt_property)? "Dynamic" : "Static"));
         }
     }
     network_mysqld_con_send_resultset(con->client, fields, rows);
@@ -722,14 +843,23 @@ void admin_show_variables(network_mysqld_con* con, const char* like)
 
 void admin_show_status(network_mysqld_con* con, const char* like)
 {
+    if (con->is_admin_client) {
+        con->admin_read_merge = 1;
+        return;
+    }
+
     const char* pattern = like ? like : "%";
     cetus_variable_t* variables = con->srv->priv->stats_variables;
 
     GPtrArray *fields = network_mysqld_proto_fielddefs_new();
-    MAKE_FIELD_DEF_2_COL(fields, "Variable_name", "Value");
+    MAKE_FIELD_DEF_3_COL(fields, "PID", "Variable_name", "Value");
 
     GPtrArray *rows = g_ptr_array_new_with_free_func(
         (void*)network_mysqld_mysql_field_row_free);
+
+    char buffer[32];
+    cetus_pid_t process_id = getpid();
+    sprintf(buffer, "%d", process_id);
 
     GList *freelist = NULL;
     int i = 0;
@@ -737,7 +867,7 @@ void admin_show_status(network_mysqld_con* con, const char* like)
         if (sql_pattern_like(pattern, variables[i].name)) {
             char* value = cetus_variable_get_value_str(&variables[i]);
             freelist = g_list_append(freelist, value);
-            APPEND_ROW_2_COL(rows, variables[i].name, value);
+            APPEND_ROW_3_COL(rows, g_strdup(buffer), variables[i].name, value);
         }
     }
     network_mysqld_con_send_resultset(con->client, fields, rows);
@@ -749,16 +879,33 @@ void admin_show_status(network_mysqld_con* con, const char* like)
 
 void admin_set_reduce_conns(network_mysqld_con* con, int mode)
 {
+    if (con->is_admin_client) {
+        return;
+    }
+
     int affected = 0;
     if (con->srv->is_reduce_conns != mode) {
         con->srv->is_reduce_conns = mode;
         affected = 1;
     }
-    network_mysqld_con_send_ok_full(con->client, affected, 0,2,0);
+    if(con->srv->config_manager->type == CHASSIS_CONF_MYSQL) {
+        network_mysqld_con_send_ok_full(con->client, affected,
+                                        0, SERVER_STATUS_AUTOCOMMIT, 0);
+    } else {
+        gint ret = CHANGE_SAVE_ERROR;
+        gint effected_rows = 0;
+        if (affected)
+            ret = save_setting(con->srv, &effected_rows);
+        send_result(con->client, ret, affected);
+    }
 }
 
 void admin_set_maintain(network_mysqld_con* con, int mode)
 {
+    if (con->is_admin_client) {
+        return;
+    }
+
     int affected = 0;
     if (con->srv->maintain_close_mode != mode) {
         con->srv->maintain_close_mode = mode;
@@ -769,13 +916,22 @@ void admin_set_maintain(network_mysqld_con* con, int mode)
 
 void admin_show_maintain(network_mysqld_con* con)
 {
+    if (con->is_admin_client) {
+        con->admin_read_merge = 1;
+        return;
+    }
+
+    char buffer[32];
+    cetus_pid_t process_id = getpid();
+    sprintf(buffer, "%d", process_id);
+
     GPtrArray *fields = network_mysqld_proto_fielddefs_new();
     GPtrArray *rows = g_ptr_array_new_with_free_func((void *)network_mysqld_mysql_field_row_free);
-    MAKE_FIELD_DEF_1_COL(fields, "Cetus maintain status");
+    MAKE_FIELD_DEF_2_COL(fields, "PID", "Cetus maintain status");
     if(con->srv->maintain_close_mode == 1) {
-        APPEND_ROW_1_COL(rows, "true");
+        APPEND_ROW_2_COL(rows, g_strdup(buffer), "true");
     } else {
-        APPEND_ROW_1_COL(rows, "false");
+        APPEND_ROW_2_COL(rows, g_strdup(buffer), "false");
     }
     network_mysqld_con_send_resultset(con->client, fields, rows);
     network_mysqld_proto_fielddefs_free(fields);
@@ -784,6 +940,8 @@ void admin_show_maintain(network_mysqld_con* con)
 
 void admin_select_version(network_mysqld_con* con)
 {
+    con->direct_answer = 1;
+
     GPtrArray* fields = network_mysqld_proto_fielddefs_new();
 
     MAKE_FIELD_DEF_1_COL(fields, "cetus version");
@@ -801,6 +959,11 @@ void admin_select_version(network_mysqld_con* con)
 
 void admin_select_connection_stat(network_mysqld_con* con, int backend_ndx, char *user)
 {
+    if (con->is_admin_client) {
+        con->admin_read_merge = 1;
+        return;
+    }
+
     GPtrArray* fields = network_mysqld_proto_fielddefs_new();
 
     MAKE_FIELD_DEF_1_COL(fields, "connection_num");
@@ -836,17 +999,6 @@ void admin_select_connection_stat(network_mysqld_con* con, int backend_ndx, char
         g_free(numstr);
 }
 
-static void bytes_to_hex_str(char* pin, int len, char* pout)
-{
-    const char* hex = "0123456789ABCDEF";
-    int i = 0;
-    for(; i < len; ++i){
-        *pout++ = hex[(*pin>>4)&0xF];
-        *pout++ = hex[(*pin++)&0xF];
-    }
-    *pout = 0;
-}
-
 static enum cetus_pwd_type password_type(char* table)
 {
     if (strcmp(table, "user_pwd")==0) {
@@ -860,6 +1012,12 @@ static enum cetus_pwd_type password_type(char* table)
 
 void admin_select_user_password(network_mysqld_con* con, char* from_table, char *user)
 {
+    if (con->is_admin_client) {
+        con->ask_one_worker = 1;
+        con->admin_read_merge = 1;
+        return;
+    }
+
     chassis_private *g = con->srv->priv;
     enum cetus_pwd_type pwd_type = password_type(from_table);
     GPtrArray* fields = network_mysqld_proto_fielddefs_new();
@@ -914,6 +1072,10 @@ void admin_select_user_password(network_mysqld_con* con, char* from_table, char 
 void admin_update_user_password(network_mysqld_con* con, char *from_table,
                                       char *user, char *password)
 {
+    if (con->is_admin_client) {
+        return;
+    }
+
     chassis_private *g = con->srv->priv;
     enum cetus_pwd_type pwd_type = password_type(from_table);
     gboolean affected = cetus_users_update_record(g->users, user, password, pwd_type);
@@ -925,6 +1087,10 @@ void admin_update_user_password(network_mysqld_con* con, char *from_table,
 
 void admin_delete_user_password(network_mysqld_con* con, char* user)
 {
+    if (con->is_admin_client) {
+        return;
+    }
+
     chassis_private *g = con->srv->priv;
     gboolean affected = cetus_users_delete_record(g->users, user);
     if (affected)
@@ -963,17 +1129,53 @@ static backend_state_t backend_state(const char* str)
 
 void admin_insert_backend(network_mysqld_con* con, char *addr, char *type, char *state)
 {
+    if (con->is_admin_client) {
+        return;
+    }
+
     chassis_private *g = con->srv->priv;
-    int affected = network_backends_add(g->backends, addr,
+  
+    int ret = network_backends_add(g->backends, addr,
                                         backend_type(type),
                                         backend_state(state), con->srv);
-    network_mysqld_con_send_ok_full(con->client, affected==0?1:0, 0,
-                                    SERVER_STATUS_AUTOCOMMIT, 0);
+    switch (ret) {
+        case BACKEND_OPERATE_SUCCESS:
+        {
+            if(con->srv->config_manager->type == CHASSIS_CONF_MYSQL) {
+                network_mysqld_con_send_ok_full(con->client, 1, 0,
+                                                SERVER_STATUS_AUTOCOMMIT, 0);
+            } else {
+                gint effected_rows = 0;
+                ret = save_setting(con->srv, &effected_rows);
+                send_result(con->client, ret, 1);
+            }
+            break;
+        }
+        case BACKEND_OPERATE_NETERR:
+        {
+            network_mysqld_con_send_error(con->client, C("get network address failed"));
+            break;
+        }
+        case BACKEND_OPERATE_DUPLICATE:
+        {
+            network_mysqld_con_send_error(con->client, C("backend is already known"));
+            break;
+        }
+        case BACKEND_OPERATE_2MASTER:
+        {
+            network_mysqld_con_send_error(con->client, C("rw node is already exists，only one rw node is allowed"));
+            break;
+        }
+    }
 }
 
 void admin_update_backend(network_mysqld_con* con, GList* equations,
                           char *cond_key, char *cond_val)
 {
+    if (con->is_admin_client) {
+        return;
+    }
+
     char* type_str = NULL;
     char* state_str = NULL;
 
@@ -1008,20 +1210,44 @@ void admin_update_backend(network_mysqld_con* con, GList* equations,
         network_mysqld_con_send_error(con->client, C("no such backend"));
         return;
     }
+
+    if (type_str && backend_type(type_str) == BACKEND_TYPE_RW &&
+            network_backend_check_available_rw(g->backends, bk->server_group))
+    {
+        if (backend_type(type_str) == bk->type) {
+            network_mysqld_con_send_ok_full(con->client, 0, 0,
+                                                SERVER_STATUS_AUTOCOMMIT, 0);
+        } else {
+            network_mysqld_con_send_error(con->client, C("rw node is already exists，only one rw node is allowed"));
+        }
+        return;
+    }
+
     int type = type_str ? backend_type(type_str) : bk->type;
     int state = state_str ? backend_state(state_str) : bk->state;
     if (type == ERROR_PARAM || state == ERROR_PARAM) {
         network_mysqld_con_send_error(con->client, C("parameter error"));
         return;
     }
-    int ok = network_backends_modify(g->backends, backend_ndx, type, state, NO_PREVIOUS_STATE);
-    int affected_rows = ok ? 1 : 0;
-    network_mysqld_con_send_ok_full(con->client, affected_rows, 0,
-                                    SERVER_STATUS_AUTOCOMMIT, 0);
+    int affected = (network_backends_modify(g->backends, backend_ndx, type, state, NO_PREVIOUS_STATE)==0)?1:0;
+    if(con->srv->config_manager->type == CHASSIS_CONF_MYSQL) {
+        network_mysqld_con_send_ok_full(con->client, affected,
+                                        0, SERVER_STATUS_AUTOCOMMIT, 0);
+    } else {
+        gint ret = CHANGE_SAVE_ERROR;
+        gint effected_rows = 0;
+        if (affected)
+            ret = save_setting(con->srv, &effected_rows);
+        send_result(con->client, ret, affected);
+    }
 }
 
 void admin_delete_backend(network_mysqld_con* con, char *key, char *val)
 {
+    if (con->is_admin_client) {
+        return;
+    }
+
     chassis_private *g = con->srv->priv;
     int backend_ndx = -1;
     if (strcasecmp(key, "backend_ndx")==0) {
@@ -1036,8 +1262,14 @@ void admin_delete_backend(network_mysqld_con* con, char *key, char *val)
 
     if (backend_ndx >= 0 && backend_ndx < network_backends_count(g->backends)) {
         network_backends_remove(g->backends, backend_ndx);/*TODO: just change state? */
-        network_mysqld_con_send_ok_full(con->client, 1, 0,
-                                        SERVER_STATUS_AUTOCOMMIT, 0);
+        if(con->srv->config_manager->type == CHASSIS_CONF_MYSQL) {
+            network_mysqld_con_send_ok_full(con->client, 1, 0,
+                                            SERVER_STATUS_AUTOCOMMIT, 0);
+        } else {
+            gint effected_rows = 0;
+            gint ret = save_setting(con->srv, &effected_rows);
+            send_result(con->client, ret, 1);
+        }
     } else {
         network_mysqld_con_send_ok_full(con->client, 0, 0,
                                         SERVER_STATUS_AUTOCOMMIT, 0);
@@ -1046,6 +1278,7 @@ void admin_delete_backend(network_mysqld_con* con, char *key, char *val)
 
 static void admin_supported_stats(network_mysqld_con* con)
 {
+    con->direct_answer = 1;
     GPtrArray* fields = network_mysqld_proto_fielddefs_new();
     MAKE_FIELD_DEF_1_COL(fields, "name");
     GPtrArray *rows = g_ptr_array_new_with_free_func(
@@ -1067,8 +1300,17 @@ void admin_get_stats(network_mysqld_con* con, char* p)
         admin_supported_stats(con);
         return;
     }
+    
+    if (con->is_admin_client) {
+        con->admin_read_merge = 1;
+        return;
+    }
+    char buffer[32];
+    cetus_pid_t process_id = getpid();
+    sprintf(buffer, "%d", process_id);
+
     GPtrArray* fields = network_mysqld_proto_fielddefs_new();
-    MAKE_FIELD_DEF_2_COL(fields, "name", "value");
+    MAKE_FIELD_DEF_3_COL(fields, "PID", "name", "value");
     GPtrArray *rows = g_ptr_array_new_with_free_func(
         (void*)network_mysqld_mysql_field_row_free);
     chassis *chas = con->srv;
@@ -1078,25 +1320,27 @@ void admin_get_stats(network_mysqld_con* con, char* p)
     if (strcasecmp(p, "client_query") == 0) {
         snprintf(buf1, 32, "%lu", stats->client_query.ro);
         snprintf(buf2, 32, "%lu", stats->client_query.rw);
-        APPEND_ROW_2_COL(rows, "client_query.ro", buf1);
-        APPEND_ROW_2_COL(rows, "client_query.rw", buf2);
+        APPEND_ROW_3_COL(rows, g_strdup(buffer), "client_query.ro", buf1);
+        APPEND_ROW_3_COL(rows, g_strdup(buffer), "client_query.rw", buf2);
     } else if (strcasecmp(p, "proxyed_query") == 0) {
         snprintf(buf1, 32, "%lu", stats->proxyed_query.ro);
         snprintf(buf2, 32, "%lu", stats->proxyed_query.rw);
-        APPEND_ROW_2_COL(rows, "proxyed_query.ro", buf1);
-        APPEND_ROW_2_COL(rows, "proxyed_query.rw", buf2);
+        APPEND_ROW_3_COL(rows, g_strdup(buffer), "proxyed_query.ro", buf1);
+        APPEND_ROW_3_COL(rows, g_strdup(buffer), "proxyed_query.rw", buf2);
     } else if (strcasecmp(p, "query_time_table") == 0) {
         int i = 0;
-        for (i; stats->query_time_table[i] && i < MAX_QUERY_TIME; ++i) {
+        for (i; i < MAX_QUERY_TIME && stats->query_time_table[i]; ++i) {
             GPtrArray* row = g_ptr_array_new_with_free_func(g_free);
+            g_ptr_array_add(row, g_strdup(buffer));
             g_ptr_array_add(row, g_strdup_printf("query_time_table.%d", i+1));
             g_ptr_array_add(row, g_strdup_printf("%lu", stats->query_time_table[i]));
             g_ptr_array_add(rows, row);
         }
     } else if (strcasecmp(p, "query_wait_table") == 0) {
         int i = 0;
-        for (i; stats->query_wait_table[i] && i < MAX_WAIT_TIME; ++i) {
+        for (i; i < MAX_WAIT_TIME && stats->query_wait_table[i]; ++i) {
             GPtrArray* row = g_ptr_array_new_with_free_func(g_free);
+            g_ptr_array_add(row, g_strdup(buffer));
             g_ptr_array_add(row, g_strdup_printf("query_wait_table.%d", i+1));
             g_ptr_array_add(row, g_strdup_printf("%lu", stats->query_wait_table[i]));
             g_ptr_array_add(rows, row);
@@ -1106,18 +1350,20 @@ void admin_get_stats(network_mysqld_con* con, char* p)
         for (i; i < network_backends_count(chas->priv->backends)
                  && i < MAX_SERVER_NUM; ++i) {
             GPtrArray* row = g_ptr_array_new_with_free_func(g_free);
+            g_ptr_array_add(row, g_strdup(buffer));
             g_ptr_array_add(row, g_strdup_printf("server_query_details.%d.ro", i+1));
             g_ptr_array_add(row, g_strdup_printf("%lu", stats->server_query_details[i].ro));
             g_ptr_array_add(rows, row);
             row = g_ptr_array_new_with_free_func(g_free);
+            g_ptr_array_add(row, g_strdup(buffer));
             g_ptr_array_add(row, g_strdup_printf("server_query_details.%d.rw", i+1));
             g_ptr_array_add(row, g_strdup_printf("%lu", stats->server_query_details[i].rw));
             g_ptr_array_add(rows, row);
         }
     } else if (strcasecmp(p, "reset") == 0) {
-        APPEND_ROW_2_COL(rows, "reset", "0");
+        APPEND_ROW_3_COL(rows, g_strdup(buffer), "reset", "0");
     } else {
-        APPEND_ROW_2_COL(rows, (char*)p, (char*)p);
+        APPEND_ROW_3_COL(rows, g_strdup(buffer), (char*)p, (char*)p);
     }
     network_mysqld_con_send_resultset(con->client, fields, rows);
 
@@ -1127,6 +1373,7 @@ void admin_get_stats(network_mysqld_con* con, char* p)
 
 static void admin_supported_config(network_mysqld_con* con)
 {
+    con->direct_answer = 1;
     GPtrArray* fields = network_mysqld_proto_fielddefs_new();
     MAKE_FIELD_DEF_1_COL(fields, "name");
     GPtrArray *rows = g_ptr_array_new_with_free_func(
@@ -1140,12 +1387,22 @@ static void admin_supported_config(network_mysqld_con* con)
 
 void admin_get_config(network_mysqld_con* con, char* p)
 {
+    if (con->is_admin_client) {
+        con->admin_read_merge = 1;
+        return;
+    }
+
     if (!p) { /* just "config get", no argument */
         admin_supported_config(con);
         return;
     }
+
+    char buffer[32];
+    cetus_pid_t process_id = getpid();
+    sprintf(buffer, "%d", process_id);
+
     GPtrArray* fields = network_mysqld_proto_fielddefs_new();
-    MAKE_FIELD_DEF_2_COL(fields, "name", "value");
+    MAKE_FIELD_DEF_3_COL(fields, "PID", "name", "value");
     GPtrArray *rows = g_ptr_array_new_with_free_func(
         (void*)network_mysqld_mysql_field_row_free);
     chassis *chas = con->srv;
@@ -1156,21 +1413,21 @@ void admin_get_config(network_mysqld_con* con, char* p)
         snprintf(buf2, 32, "%f", chas->slave_delay_down_threshold_sec);
         snprintf(buf3, 32, "%f", chas->slave_delay_recover_threshold_sec);
         snprintf(buf4, 32, "%d", chas->long_query_time);
-        APPEND_ROW_2_COL(rows, "common.check_slave_delay", buf1);
-        APPEND_ROW_2_COL(rows, "common.slave_delay_down_threshold_sec", buf2);
-        APPEND_ROW_2_COL(rows, "common.slave_delay_recover_threshold_sec", buf3);
-        APPEND_ROW_2_COL(rows, "common.long_query_time", buf4);
+        APPEND_ROW_3_COL(rows, g_strdup(buffer), "common.check_slave_delay", buf1);
+        APPEND_ROW_3_COL(rows, g_strdup(buffer), "common.slave_delay_down_threshold_sec", buf2);
+        APPEND_ROW_3_COL(rows, g_strdup(buffer), "common.slave_delay_recover_threshold_sec", buf3);
+        APPEND_ROW_3_COL(rows, g_strdup(buffer), "common.long_query_time", buf4);
     } else if (strcasecmp(p, "pool") == 0) {
         snprintf(buf1, 32, "%d", chas->mid_idle_connections);
         snprintf(buf2, 32, "%d", chas->max_idle_connections);
         snprintf(buf3, 32, "%d", chas->max_resp_len);
         snprintf(buf4, 32, "%d", chas->master_preferred);
-        APPEND_ROW_2_COL(rows, "pool.default_pool_size", buf1);
-        APPEND_ROW_2_COL(rows, "pool.max_pool_size", buf2);
-        APPEND_ROW_2_COL(rows, "pool.max_resp_len", buf3);
-        APPEND_ROW_2_COL(rows, "pool.master_preferred", buf4);
+        APPEND_ROW_3_COL(rows, g_strdup(buffer), "pool.default_pool_size", buf1);
+        APPEND_ROW_3_COL(rows, g_strdup(buffer), "pool.max_pool_size", buf2);
+        APPEND_ROW_3_COL(rows, g_strdup(buffer), "pool.max_resp_len", buf3);
+        APPEND_ROW_3_COL(rows, g_strdup(buffer), "pool.master_preferred", buf4);
     } else {
-        APPEND_ROW_2_COL(rows, (char*)p, (char*)p);
+        APPEND_ROW_3_COL(rows, g_strdup(buffer), (char*)p, (char*)p);
     }
     network_mysqld_con_send_resultset(con->client, fields, rows);
 
@@ -1180,10 +1437,14 @@ void admin_get_config(network_mysqld_con* con, char* p)
 
 void admin_set_config(network_mysqld_con* con, char* key, char* value)
 {
-    char msg[128] = {0};
+    if (con->is_admin_client) {
+        return;
+    }
+
     GList *options = admin_get_all_options(con->srv);
     chassis_option_t* opt = chassis_options_get(options, key);
     if (!opt) {
+        char msg[128] = {0};
         snprintf(msg, sizeof(msg), "no such variable: %s", key);
         network_mysqld_con_send_error(con->client, L(msg));
         g_list_free(options);
@@ -1202,7 +1463,13 @@ void admin_set_config(network_mysqld_con* con, char* key, char* value)
     }
 
     if(0 == ret) {
-        network_mysqld_con_send_ok_full(con->client, 1, 0, SERVER_STATUS_AUTOCOMMIT, 0);
+        if(con->srv->config_manager->type == CHASSIS_CONF_MYSQL) {
+            network_mysqld_con_send_ok_full(con->client, 1, 0, SERVER_STATUS_AUTOCOMMIT, 0);
+        } else {
+            gint effected_rows = 0;
+            gint save_ret = save_setting(con->srv, &effected_rows);
+            send_result(con->client, save_ret, 1);
+        }
     } else if(ASSIGN_NOT_SUPPORT == ret){
         network_mysqld_con_send_error_full(con->client, C("Variable cannot be set dynamically"), 1065, "28000");
     } else if(ASSIGN_VALUE_INVALID == ret){
@@ -1255,6 +1522,10 @@ static void admin_reload_settings(network_mysqld_con* con)
 
 void admin_config_reload(network_mysqld_con* con, char* object)
 {
+    if (con->is_admin_client) {
+        return;
+    }
+
     if (object == NULL) {
         return admin_reload_settings(con);
     } else if (strcasecmp(object, "user")==0) {
@@ -1267,13 +1538,48 @@ void admin_config_reload(network_mysqld_con* con, char* object)
         } else {
             network_mysqld_con_send_error(con->client, C("read user failed"));
         }
+    } else if (strcasecmp(object, "variables") == 0) {
+        char* var_json = NULL;
+        if (chassis_config_reload_variables(con->srv->config_manager, object, &var_json)) {
+            if (sql_filter_vars_reload_str_rules(var_json) == FALSE) {
+                g_warning("variable rule reload error");
+            }
+            g_free(var_json);
+            network_mysqld_con_send_ok(con->client);
+        } else {
+            network_mysqld_con_send_error(con->client, C("reload variables failed"));
+        }
     } else {
         network_mysqld_con_send_error(con->client, C("wrong parameter"));
     }
 }
 
+void admin_kill_query(network_mysqld_con* con, guint32 thread_id)
+{
+    if (con->is_admin_client) {
+        con->process_index = thread_id >> 24;
+
+        if (con->process_index > cetus_last_process) {
+            con->direct_answer = 1;
+            network_mysqld_con_send_error(con->client, C("thread id is not correct"));
+        } else {
+            con->ask_the_given_worker = 1;
+        }
+
+        return;
+    }
+
+    gboolean ok = network_mysqld_kill_connection(con->srv, thread_id);
+    network_mysqld_con_send_ok_full(con->client, ok ? 1 : 0, 0, SERVER_STATUS_AUTOCOMMIT, 0);
+
+}
+
 void admin_reset_stats(network_mysqld_con* con)
 {
+    if (con->is_admin_client) {
+        return;
+    }
+
     query_stats_t* stats = &con->srv->query_stats;
     memset(stats, 0, sizeof(*stats));
     network_mysqld_con_send_ok_full(con->client, 1, 0,
@@ -1282,6 +1588,12 @@ void admin_reset_stats(network_mysqld_con* con)
 
 void admin_select_all_groups(network_mysqld_con* con)
 {
+    if (con->is_admin_client) {
+        con->ask_one_worker = 1;
+        con->admin_read_merge = 1;
+        return;
+    }
+
     GPtrArray *fields = network_mysqld_proto_fielddefs_new();
 
     MYSQL_FIELD *field = network_mysqld_proto_fielddef_new();
@@ -1344,10 +1656,10 @@ static struct sql_help_entry_t {
     {"delete allow_ip/deny_ip '<user>@<address>'", "delete address from white list of module", ALL_HELP},
     {"set reduce_conns (true|false)", "reduce idle connections if set to true", ALL_HELP},
     {"set maintain (true|false)", "close all client connections if set to true", ALL_HELP},
+    {"show maintain status", "show maintain status", ALL_HELP},
     {"show status [like '%pattern%']", "show select/update/insert/delete statistics", ALL_HELP},
     {"show variables [like '%pattern%']", NULL, ALL_HELP},
     {"select version", "cetus version", ALL_HELP},
-    {"select conn_num from backends where backend_ndx=<index> and user='<name>')", NULL, ALL_HELP},
     {"select * from user_pwd [where user='<name>']", NULL, ALL_HELP},
     {"select * from app_user_pwd [where user='<name>']", NULL, ALL_HELP},
     {"update user_pwd set password='xx' where user='<name>'", NULL, ALL_HELP},
@@ -1381,11 +1693,15 @@ static struct sql_help_entry_t {
     {"sql log status", "show sql log status", ALL_HELP},
     {"sql log start", "start sql log thread", ALL_HELP},
     {"sql log stop", "stop sql log thread", ALL_HELP},
+    {"kill query <tid>", "kill session when the thread id is equal to tid ", ALL_HELP},
     {NULL, NULL, 0}
 };
 
 void admin_select_help(network_mysqld_con* con)
 {
+    g_debug("%s:call admin_select_help", G_STRLOC);
+    con->direct_answer = 1;
+
     int needed_type = con->config->has_shard_plugin ? SHARD_HELP : RW_HELP;
     GPtrArray* fields = network_mysqld_proto_fielddefs_new();
     MAKE_FIELD_DEF_2_COL(fields, "Command", "Description");
@@ -1418,45 +1734,54 @@ static void get_module_names(chassis* chas, GString* plugin_names)
 
 void admin_send_overview(network_mysqld_con* con)
 {
+    if (con->is_admin_client) {
+        con->admin_read_merge = 1;
+        return;
+    }
+
     chassis_private* g = con->srv->priv;
     chassis_plugin_config *config = con->config;
     GPtrArray *fields = network_mysqld_proto_fielddefs_new();
-    MAKE_FIELD_DEF_2_COL(fields, "Status", "Value");
+    MAKE_FIELD_DEF_3_COL(fields, "PID", "Status", "Value");
+
+    char buffer[32];
+    cetus_pid_t process_id = getpid();
+    sprintf(buffer, "%d", process_id);
 
     GPtrArray *rows = g_ptr_array_new_with_free_func(
         (void*)network_mysqld_mysql_field_row_free);
-    APPEND_ROW_2_COL(rows, "Cetus version", PLUGIN_VERSION);
+    APPEND_ROW_3_COL(rows, g_strdup(buffer), "Cetus version", PLUGIN_VERSION);
     char start_time[32];
     chassis_epoch_to_string(&con->srv->startup_time, C(start_time));
-    APPEND_ROW_2_COL(rows, "Startup time", start_time);
+    APPEND_ROW_3_COL(rows, g_strdup(buffer), "Startup time", start_time);
     GString* plugin_names = g_string_new(0);
     get_module_names(con->srv, plugin_names);
-    APPEND_ROW_2_COL(rows, "Loaded modules", plugin_names->str);
+    APPEND_ROW_3_COL(rows, g_strdup(buffer), "Loaded modules", plugin_names->str);
     const int bsize = 32;
     static char buf1[32], buf2[32], buf3[32];
     snprintf(buf1, bsize, "%d", network_backends_idle_conns(g->backends));
-    APPEND_ROW_2_COL(rows, "Idle backend connections", buf1);
+    APPEND_ROW_3_COL(rows, g_strdup(buffer), "Idle backend connections", buf1);
     snprintf(buf2, bsize, "%d", network_backends_used_conns(g->backends));
-    APPEND_ROW_2_COL(rows, "Used backend connections", buf2);
-    snprintf(buf3, bsize, "%d", g->cons->len);
-    APPEND_ROW_2_COL(rows, "Client connections", buf3);
+    APPEND_ROW_3_COL(rows, g_strdup(buffer), "Used backend connections", buf2);
+    snprintf(buf3, bsize, "%d", g->cons->len - 1);
+    APPEND_ROW_3_COL(rows, g_strdup(buffer), "Client connections", buf3);
 
     query_stats_t* stats = &(con->srv->query_stats);
     char qcount[32];
     snprintf(qcount, 32, "%ld", stats->client_query.ro+stats->client_query.rw);
-    APPEND_ROW_2_COL(rows, "Query count", qcount);
+    APPEND_ROW_3_COL(rows, g_strdup(buffer), "Query count", qcount);
 
     if (config->has_shard_plugin) {
         char xacount[32];
         snprintf(xacount, 32, "%ld", stats->xa_count);
-        APPEND_ROW_2_COL(rows, "XA count", xacount);
+        APPEND_ROW_3_COL(rows, g_strdup(buffer), "XA count", xacount);
     }
     char qps[64];
     admin_stats_get_average(con->config->admin_stats, ADMIN_STATS_QPS, C(qps));
-    APPEND_ROW_2_COL(rows, "QPS (1min, 5min, 15min)", qps);
+    APPEND_ROW_3_COL(rows, g_strdup(buffer), "QPS (1min, 5min, 15min)", qps);
     char tps[64];
     admin_stats_get_average(con->config->admin_stats, ADMIN_STATS_TPS, C(tps));
-    APPEND_ROW_2_COL(rows, "TPS (1min, 5min, 15min)", tps);
+    APPEND_ROW_3_COL(rows, g_strdup(buffer), "TPS (1min, 5min, 15min)", tps);
     network_mysqld_con_send_resultset(con->client, fields, rows);
 
     network_mysqld_proto_fielddefs_free(fields);
@@ -1502,6 +1827,10 @@ static gboolean convert_datetime_partitions(GPtrArray *partitions, sharding_vdb_
 void admin_create_vdb(network_mysqld_con* con, int id, GPtrArray* partitions,
                       enum sharding_method_t method, int key_type, int shard_num)
 {
+    if (con->is_admin_client) {
+        return;
+    }
+
     sharding_vdb_t* vdb = sharding_vdb_new();
     vdb->id = id;
     vdb->method = method;
@@ -1535,6 +1864,7 @@ void admin_create_vdb(network_mysqld_con* con, int id, GPtrArray* partitions,
     gboolean ok = sharding_vdb_is_valid(vdb, g->backends->groups->len)
         && shard_conf_add_vdb(vdb);
     if (ok) {
+        g_message("Admin: %s", con->orig_sql->str);
         shard_conf_write_json(con->srv->config_manager);
         network_mysqld_con_send_ok(con->client);
     } else {
@@ -1546,6 +1876,10 @@ void admin_create_vdb(network_mysqld_con* con, int id, GPtrArray* partitions,
 void admin_create_sharded_table(network_mysqld_con* con, const char* schema,
                                 const char* table, const char* key, int vdb_id)
 {
+    if (con->is_admin_client) {
+        return;
+    }
+
     sharding_table_t* t = g_new0(sharding_table_t, 1);
     t->vdb_id = vdb_id;
     t->schema = g_string_new(schema);
@@ -1553,6 +1887,7 @@ void admin_create_sharded_table(network_mysqld_con* con, const char* schema,
     t->pkey = g_string_new(key);
     gboolean ok = shard_conf_add_sharded_table(t);
     if (ok) {
+        g_message("Admin: %s", con->orig_sql->str);
         shard_conf_write_json(con->srv->config_manager);
         network_mysqld_con_send_ok(con->client);
     } else {
@@ -1562,6 +1897,12 @@ void admin_create_sharded_table(network_mysqld_con* con, const char* schema,
 
 void admin_select_vdb(network_mysqld_con* con)
 {
+    if (con->is_admin_client) {
+        con->ask_one_worker = 1;
+        con->admin_read_merge = 1;
+        return;
+    }
+
     GList* vdb_list = shard_conf_get_vdb_list();
     GPtrArray* fields = network_mysqld_proto_fielddefs_new();
     MAKE_FIELD_DEF_3_COL(fields, "VDB id", "Method", "Partitions");
@@ -1591,6 +1932,12 @@ void admin_select_vdb(network_mysqld_con* con)
 
 void admin_select_sharded_table(network_mysqld_con* con)
 {
+    if (con->is_admin_client) {
+        con->ask_one_worker = 1;
+        con->admin_read_merge = 1;
+        return;
+    }
+
     GList* tables = shard_conf_get_tables();
     GPtrArray* fields = network_mysqld_proto_fielddefs_new();
     MAKE_FIELD_DEF_3_COL(fields, "Table", "VDB id", "Key");
@@ -1612,13 +1959,12 @@ void admin_select_sharded_table(network_mysqld_con* con)
     g_list_free(tables);
 }
 
-void admin_save_settings(network_mysqld_con *con)
+static gint save_setting(chassis *srv, gint *effected_rows)
 {
-    chassis *srv = con->srv;
+    gint ret = ASSIGN_OK;
+
     GKeyFile *keyfile = g_key_file_new();
     g_key_file_set_list_separator(keyfile, ',');
-    gint ret = ASSIGN_OK;
-    gint effected_rows = 0;
     GString *free_path = g_string_new(NULL);
 
     if(srv->default_file == NULL) {
@@ -1648,56 +1994,71 @@ void admin_save_settings(network_mysqld_con *con)
         new_file = g_string_append(new_file, ".old");
 
         if (remove(new_file->str)) {
-            g_debug("remove operate, filename:%s, errno:%d",
+            g_message("remove operate, filename:%s, errno:%d",
                     new_file->str == NULL? "":new_file->str, errno);
         }
-
-        if(rename(srv->default_file, new_file->str)) {
-            g_debug("rename operate failed, filename:%s, filename:%s, errno:%d",
+        if (rename(srv->default_file, new_file->str)) {
+            g_message("rename operate failed, filename:%s, filename:%s, errno:%d",
                     (srv->default_file == NULL ? "":srv->default_file),
                     (new_file->str == NULL ? "":new_file->str), errno);
-            ret = RENAME_ERROR;
         }
         g_string_free(new_file, TRUE);
     }
-
     if(ret == ASSIGN_OK) {
         /* save new config */
-        effected_rows = chassis_options_save(keyfile, srv->options, srv);
+        *effected_rows = chassis_options_save(keyfile, srv->options, srv);
         gsize file_size = 0;
         gchar *file_buf = g_key_file_to_data(keyfile, &file_size, NULL);
         GError *gerr = NULL;
         if (FALSE == g_file_set_contents(srv->default_file, file_buf, file_size, &gerr)) {
             ret = SAVE_ERROR;
             g_clear_error(&gerr);
-        } else {
-            if((ret = chmod(srv->default_file, S_IRUSR|S_IWUSR|S_IRGRP|S_IWGRP))) {
-                g_debug("remove operate failed, filename:%s, errno:%d",
-                        (srv->default_file == NULL? "":srv->default_file), errno);
-                ret = CHMOD_ERROR;
-            }
         }
     }
+    return ret;
+}
 
+static void send_result(network_socket *client, gint ret, gint affected)
+{
     if(ret == ASSIGN_OK) {
-        network_mysqld_con_send_ok_full(con->client, effected_rows,
+        network_mysqld_con_send_ok_full(client, affected,
                                         0, SERVER_STATUS_AUTOCOMMIT, 0);
     } else {
         char *msg = NULL;
         switch (ret) {
-        case RENAME_ERROR: msg = "rename file failed"; break;
         case SAVE_ERROR: msg = "save file failed"; break;
-        case CHMOD_ERROR: msg = "chmod file failed"; break;
+        case CHANGE_SAVE_ERROR: msg = "change config and save file failed"; break;
+        default:msg = "unknown error type"; break;
         }
-        network_mysqld_con_send_error_full(con->client, L(msg), 1066, "28000");
+        network_mysqld_con_send_error_full(client, L(msg), 1066, "28000");
     }
 }
+
+void admin_save_settings(network_mysqld_con *con)
+{
+    if (con->is_admin_client) {
+        con->ask_one_worker = 1;
+        return;
+    }
+
+    chassis *srv = con->srv;
+    gint effected_rows = 0;
+    gint ret = save_setting(srv, &effected_rows);
+
+    network_socket *client = con->client;
+    send_result(client, ret, effected_rows);
+}
+
 void admin_compatible_cmd(network_mysqld_con* con)
 {
+    con->direct_answer = 1;
     network_mysqld_con_send_ok(con->client);
 }
+
 void admin_show_databases(network_mysqld_con* con)
 {
+    g_debug("%s:call admin_show_databases", G_STRLOC);
+    con->direct_answer = 1;
     GPtrArray* fields = network_mysqld_proto_fielddefs_new();
 
     MAKE_FIELD_DEF_1_COL(fields, "Database");
@@ -1716,8 +2077,13 @@ void admin_show_databases(network_mysqld_con* con)
 void admin_create_single_table(network_mysqld_con* con, const char* schema,
                                const char* table, const char* group)
 {
+    if (con->is_admin_client) {
+        return;
+    }
+
     gboolean ok = shard_conf_add_single_table(schema, table, group);
     if (ok) {
+        g_message("Admin: %s", con->orig_sql->str);
         shard_conf_write_json(con->srv->config_manager);
         network_mysqld_con_send_ok_full(con->client, 1, 0, SERVER_STATUS_AUTOCOMMIT, 0);
     } else {
@@ -1727,6 +2093,12 @@ void admin_create_single_table(network_mysqld_con* con, const char* schema,
 
 void admin_select_single_table(network_mysqld_con* con)
 {
+    if (con->is_admin_client) {
+        con->ask_one_worker = 1;
+        con->admin_read_merge = 1;
+        return;
+    }
+
     GList* tables = shard_conf_get_single_tables();
     GPtrArray* fields = network_mysqld_proto_fielddefs_new();
     MAKE_FIELD_DEF_2_COL(fields, "Table", "Group");
@@ -1750,6 +2122,11 @@ void admin_sql_log_start(network_mysqld_con* con) {
         network_mysqld_con_send_error(con->client, C("Unexpected error"));
         return;
     }
+    
+    if (con->is_admin_client) {
+        return;
+    }
+
     if (con->srv->sql_mgr->sql_log_switch == OFF) {
         network_mysqld_con_send_error(con->client, C("can not start sql log thread, because sql-log-switch = OFF"));
         return;
@@ -1767,6 +2144,11 @@ void admin_sql_log_stop(network_mysqld_con* con) {
         network_mysqld_con_send_error(con->client, C("Unexpected error"));
         return;
     }
+    
+    if (con->is_admin_client) {
+        return;
+    }
+
     if (con->srv->sql_mgr->sql_log_action == SQL_LOG_START) {
         con->srv->sql_mgr->sql_log_action = SQL_LOG_UNKNOWN;
         network_mysqld_con_send_ok(con->client);
@@ -1780,16 +2162,27 @@ void admin_sql_log_status(network_mysqld_con* con) {
         network_mysqld_con_send_error(con->client, C("Unexpected error"));
         return;
     }
+    
+    if (con->is_admin_client) {
+        con->admin_read_merge = 1;
+        return;
+    }
+
     gchar* pattern = g_strdup("%sql-log-%");
     GList *options = admin_get_all_options(con->srv);
 
     GPtrArray *fields = network_mysqld_proto_fielddefs_new();
-    MAKE_FIELD_DEF_3_COL(fields, "Variable_name", "Value", "Property");
+    MAKE_FIELD_DEF_4_COL(fields, "PID", "Variable_name", "Value", "Property");
+
+    char buffer[32];
+    cetus_pid_t process_id = getpid();
+    sprintf(buffer, "%d", process_id);
 
     GPtrArray *rows = g_ptr_array_new_with_free_func((void *)network_mysqld_mysql_field_row_free);
 
     GList *freelist = NULL;
     GList *l = NULL;
+
     for (l = options; l; l = l->next) {
         chassis_option_t *opt = l->data;
         /* just support these for now */
@@ -1802,19 +2195,22 @@ void admin_sql_log_status(network_mysqld_con* con) {
                 continue;
             }
             freelist = g_list_append(freelist, value);
-            APPEND_ROW_3_COL(rows, (char *)opt->long_name, value, (CAN_ASSIGN_OPTS_PROPERTY(opt->opt_property)? "Dynamic" : "Static"));
+            APPEND_ROW_4_COL(rows, g_strdup(buffer), (char *)opt->long_name, value,
+                    (CAN_ASSIGN_OPTS_PROPERTY(opt->opt_property)? "Dynamic" : "Static"));
         }
     }
-    APPEND_ROW_3_COL(rows, "sql-log-state", con->srv->sql_mgr->sql_log_action == SQL_LOG_START ? "running": "stopped", "Internal");
+
+    APPEND_ROW_4_COL(rows, g_strdup(buffer), "sql-log-state", 
+            con->srv->sql_mgr->sql_log_action == SQL_LOG_START ? "running": "stopped", "Internal");
     gchar *cached = NULL;
     if (con->srv->sql_mgr->fifo && (con->srv->sql_mgr->sql_log_action == SQL_LOG_START)) {
         cached = g_strdup_printf("%u", con->srv->sql_mgr->fifo->in - con->srv->sql_mgr->fifo->in);
     } else {
         cached = g_strdup("NULL");
     }
-    APPEND_ROW_3_COL(rows, "sql-log-cached", cached, "Internal");
+    APPEND_ROW_4_COL(rows, g_strdup(buffer), "sql-log-cached", cached, "Internal");
     gchar *cursize = g_strdup_printf("%lu", con->srv->sql_mgr->sql_log_cursize);
-    APPEND_ROW_3_COL(rows, "sql-log-cursize", cursize, "Internal");
+    APPEND_ROW_4_COL(rows, g_strdup(buffer), "sql-log-cursize", cursize, "Internal");
 
     APPEND_ROW_3_COL(rows, "sql-log-fullname", con->srv->sql_mgr->sql_log_fullname == NULL ? "NULL" : con->srv->sql_mgr->sql_log_fullname, "Internal");
 
@@ -1829,8 +2225,3 @@ void admin_sql_log_status(network_mysqld_con* con) {
     g_free(cursize);
 }
 
-void admin_kill_query(network_mysqld_con* con, int id)
-{
-    gboolean ok = network_mysqld_kill_connection(con->srv, id);
-    network_mysqld_con_send_ok_full(con->client, ok ? 1 : 0, 0, SERVER_STATUS_AUTOCOMMIT, 0);
-}

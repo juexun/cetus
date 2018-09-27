@@ -52,12 +52,14 @@ typedef struct chassis_private chassis_private;
 typedef struct chassis chassis;
 
 #define MAX_SERVER_NUM 64
-#define MAX_SERVER_NUM_FOR_PREPARE 16
+#define MAX_SERVER_NUM_FOR_PREPARE 32
+#define MAX_WORK_PROCESSES 64
+#define MAX_WORK_PROCESSES_SHIFT 6
 #define MAX_QUERY_TIME 1000
 #define MAX_WAIT_TIME 1024
 #define MAX_TRY_NUM 6
 #define MAX_CREATE_CONN_NUM 512
-#define MAX_DIST_TRAN_PREFIX 32
+#define MAX_DIST_TRAN_PREFIX 64
 #define DEFAULT_LIVE_TIME 7200
 
 #define MAX_ALLOWED_PACKET_CEIL    (1 * GB)
@@ -88,17 +90,18 @@ typedef struct query_stats_t {
     rw_op_t server_query_details[MAX_SERVER_NUM];
 } query_stats_t;
 
+#ifndef SIMPLE_PARSER
 /* For generating unique global ids for MySQL */
 struct incremental_guid_state_t {
     unsigned int last_sec;
+    unsigned int last_msec;
     int worker_id;
-    int rand_id;
-    int init_rand_id;
     int seq_id;
 };
 
 void incremental_guid_init(struct incremental_guid_state_t *s);
 uint64_t incremental_guid_get_next(struct incremental_guid_state_t *s);
+#endif
 
 struct chassis {
     struct event_base *event_base;
@@ -106,6 +109,7 @@ struct chassis {
 
     /**< array(chassis_plugin) */
     GPtrArray *modules;
+    void *admin_plugin;
 
     /**< base directory for all relative paths referenced */
     gchar *base_dir;
@@ -117,6 +121,7 @@ struct chassis {
 
     char *proxy_address;
     char *default_db;
+    char *ifname;
     char *default_username;
     char *default_charset;
     char *default_hashed_pwd;
@@ -145,6 +150,10 @@ struct chassis {
     unsigned int min_req_time_for_cache;
     int cetus_max_allowed_packet;
     int disable_dns_cache;
+    int enable_admin_listen;
+
+    int worker_processes;
+    int cpus;
 
     int max_alive_time;
     int max_resp_len;
@@ -172,7 +181,10 @@ struct chassis {
 
     query_stats_t query_stats;
 
+
+#ifndef SIMPLE_PARSER
     struct incremental_guid_state_t guid_state;
+#endif
     time_t startup_time;
     time_t current_time;
     struct chassis_options_t *options;
@@ -184,12 +196,14 @@ struct chassis {
 
     gint verbose_shutdown;
     gint daemon_mode;
+    char **argv;
+    int    argc;
     gchar *pid_file;
+    gchar *old_pid_file;
     gchar *log_level;
     gchar **plugin_names;
     gchar *log_xa_filename;
     guint invoke_dbg_on_crash;
-    guint auto_restart;
     gint max_files_number;
     char *remote_config_url;
     gchar *default_file;

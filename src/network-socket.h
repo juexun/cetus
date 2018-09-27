@@ -193,12 +193,13 @@ typedef struct {
 NETWORK_API network_socket *network_socket_new(void);
 NETWORK_API void network_socket_free(network_socket *s);
 NETWORK_API network_socket_retval_t network_socket_write(network_socket *con, int send_chunks);
+NETWORK_API void network_socket_send_quit_and_free(network_socket *s);
 NETWORK_API network_socket_retval_t network_socket_read(network_socket *con);
 NETWORK_API network_socket_retval_t network_socket_to_read(network_socket *sock);
 NETWORK_API network_socket_retval_t network_socket_set_non_blocking(network_socket *sock);
 NETWORK_API network_socket_retval_t network_socket_connect(network_socket *con);
 NETWORK_API network_socket_retval_t network_socket_connect_finish(network_socket *sock);
-NETWORK_API network_socket_retval_t network_socket_bind(network_socket *con);
+NETWORK_API network_socket_retval_t network_socket_bind(network_socket *con, int advanced_mode);
 NETWORK_API network_socket *network_socket_accept(network_socket *srv, int *reason);
 NETWORK_API network_socket_retval_t network_socket_set_send_buffer_size(network_socket *sock, int size);
 
